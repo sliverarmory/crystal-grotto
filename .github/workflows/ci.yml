@@ -1,0 +1,104 @@
+# SPDX-License-Identifier: GPL-3.0-only
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Unit, E2E, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Verify module metadata and downloads
+        run: |
+          go mod tidy -diff
+          go mod verify
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+          if [[ -n "$files" ]]; then
+            printf 'The following files need gofmt:\n%s\n' "$files" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Run unit and deterministic E2E tests
+        run: go test -race -count=1 ./...
+
+      - name: Build command
+        run: go build -trimpath -o "${RUNNER_TEMP}/crystal-grotto" ./cmd/crystal-grotto
+
+  compatibility:
+    name: Crystal Palace compatibility
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      TZ: UTC
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      - name: Install compatibility toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ant mingw-w64
+
+      - name: Fetch and build pinned Crystal Palace
+        run: ./scripts/fetch-crystal-palace.sh "${RUNNER_TEMP}/crystal-palace"
+
+      - name: Build Crystal Grotto
+        run: go build -trimpath -o "${RUNNER_TEMP}/crystal-grotto" ./cmd/crystal-grotto
+
+      - name: Run upstream compatibility tests
+        env:
+          CRYSTAL_PALACE_JAR: ${{ runner.temp }}/crystal-palace/cpsrc/build/crystalpalace.jar
+          CRYSTAL_GROTTO_BIN: ${{ runner.temp }}/crystal-grotto
+        run: go test -tags=compat -count=1 ./...

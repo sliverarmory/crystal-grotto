@@ -1,0 +1,22 @@
+Crystal Grotto
+Copyright (C) 2026 Crystal Grotto contributors
+
+Crystal Grotto is distributed under the GNU General Public License,
+version 3 only (GPL-3.0-only). See LICENSE.
+
+Crystal Grotto is a Go port based on Crystal Palace:
+
+    Crystal Palace
+    Copyright 2025 Raphael Mudge, Adversary Fan Fiction Writers Guild
+    https://tradecraftgarden.org/crystalpalace.html
+
+The compatibility baseline is the Crystal Palace source distribution dated
+2026-07-16 (cpsrc20260716.tgz). Crystal Palace is distributed under the
+3-clause BSD license. Its copyright notice, license conditions, and disclaimer
+are reproduced verbatim in LICENSE.upstream.
+
+LICENSE.upstream preserves the terms and notices that apply to upstream
+Crystal Palace material. It is not an alternative license for Crystal Grotto
+as a whole.
+
+Third-party dependencies retain their respective copyrights and licenses.
