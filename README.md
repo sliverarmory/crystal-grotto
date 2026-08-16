@@ -1,5 +1,7 @@
 # Crystal Grotto
 
+<img src=".github/images/crystal-grotto.webp" alt="Crystal Grotto" align="right" width="280">
+
 Crystal Grotto is a Go port of [Crystal Palace](https://tradecraftgarden.org/crystalpalace.html), a linker and linker-script language for building and transforming position-independent Windows code. The port aims to preserve the upstream command and specification-language contracts in a native Go implementation and command-line application.
 
 The project is under active development. Compatibility is measured against a pinned upstream distribution and backed by unit, end-to-end, and differential tests.
