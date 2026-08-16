@@ -6,6 +6,8 @@ Crystal Grotto is a Go port of [Crystal Palace](https://tradecraftgarden.org/cry
 
 The project is under active development. Compatibility is measured against a pinned upstream distribution and backed by unit, end-to-end, and differential tests.
 
+<br clear="right">
+
 ## Compatibility baseline
 
 Crystal Grotto targets the Crystal Palace source distribution dated **2026-07-16**:
