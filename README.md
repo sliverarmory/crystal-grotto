@@ -80,6 +80,13 @@ go build -trimpath -o crystal-grotto ./cmd/crystal-grotto
 ./crystal-grotto --help
 ```
 
+## Releases
+
+Pushing a semantic-version tag whose commit is reachable from `main` triggers
+the release workflow. It tests the tagged source, builds distribution archives
+for Linux, macOS, and Windows on amd64 and arm64, publishes SHA-256 checksums,
+and creates the corresponding [GitHub Release](https://github.com/sliverarmory/crystal-grotto/releases).
+
 ## Tests
 
 Run all unit tests and deterministic Go end-to-end tests with:

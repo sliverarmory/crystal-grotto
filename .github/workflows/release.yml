@@ -1,0 +1,225 @@
+# SPDX-License-Identifier: GPL-3.0-only
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Validate tag and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release tag is on main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            printf 'Release workflow must run for a tag, not %s.\n' "${GITHUB_REF_TYPE}" >&2
+            exit 1
+          fi
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            printf 'Release tag %q is not a semantic version such as v0.0.1.\n' "${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          tag_commit="$(git rev-list -n 1 "${GITHUB_REF_NAME}^{commit}")"
+          if ! git merge-base --is-ancestor "${tag_commit}" refs/remotes/origin/main; then
+            printf 'Tag %s resolves to %s, which is not reachable from origin/main.\n' \
+              "${GITHUB_REF_NAME}" "${tag_commit}" >&2
+            exit 1
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify module metadata and downloads
+        run: |
+          go mod tidy -diff
+          go mod verify
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          files="$(gofmt -l .)"
+          if [[ -n "${files}" ]]; then
+            printf 'The following files need gofmt:\n%s\n' "${files}" >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Run unit and deterministic E2E tests
+        run: go test -v -p=1 -count=1 -timeout=10m ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        goos:
+          - linux
+          - darwin
+          - windows
+        goarch:
+          - amd64
+          - arm64
+
+    steps:
+      - name: Check out tagged revision
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build distribution archive
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          archive_base="crystal-grotto-${version}-${GOOS}-${GOARCH}"
+          stage="${RUNNER_TEMP}/release-stage"
+          package_dir="${stage}/${archive_base}"
+          mkdir -p "${package_dir}" "${GITHUB_WORKSPACE}/dist"
+
+          executable='crystal-grotto'
+          if [[ "${GOOS}" == 'windows' ]]; then
+            executable+='.exe'
+          fi
+
+          CGO_ENABLED=0 go build \
+            -trimpath \
+            -ldflags="-s -w -X github.com/sliverarmory/crystal-grotto.applicationVersion=${version}" \
+            -o "${package_dir}/${executable}" \
+            ./cmd/crystal-grotto
+          if [[ "${GOOS}/${GOARCH}" == 'linux/amd64' ]]; then
+            reported_version="$("${package_dir}/${executable}" --version)"
+            if [[ "${reported_version}" != "crystal-grotto version ${version}" ]]; then
+              printf 'Release binary reported an unexpected version: %s\n' \
+                "${reported_version}" >&2
+              exit 1
+            fi
+          fi
+          cp README.md LICENSE LICENSE.upstream NOTICE "${package_dir}/"
+
+          if [[ "${GOOS}" == 'windows' ]]; then
+            (
+              cd "${stage}"
+              zip -q -r "${GITHUB_WORKSPACE}/dist/${archive_base}.zip" "${archive_base}"
+            )
+          else
+            tar -C "${stage}" -czf \
+              "${GITHUB_WORKSPACE}/dist/${archive_base}.tar.gz" \
+              "${archive_base}"
+          fi
+
+      - name: Upload distribution archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: crystal-grotto-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download distribution archives
+        uses: actions/download-artifact@v8
+        with:
+          pattern: crystal-grotto-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify archives and write checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="${GITHUB_REF_NAME#v}"
+          archive_names=()
+          for goos in linux darwin; do
+            for goarch in amd64 arm64; do
+              archive_names+=("crystal-grotto-${version}-${goos}-${goarch}.tar.gz")
+            done
+          done
+          for goarch in amd64 arm64; do
+            archive_names+=("crystal-grotto-${version}-windows-${goarch}.zip")
+          done
+
+          for archive in "${archive_names[@]}"; do
+            if [[ ! -s "dist/${archive}" ]]; then
+              printf 'Missing or empty release archive: %s\n' "${archive}" >&2
+              exit 1
+            fi
+          done
+
+          (
+            cd dist
+            sha256sum "${archive_names[@]}" > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
+
+      - name: Create or repair GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t assets < <(find dist -maxdepth 1 -type f -print | sort)
+          if [[ "${#assets[@]}" -ne 7 ]]; then
+            printf 'Expected six archives and SHA256SUMS, found %d files.\n' "${#assets[@]}" >&2
+            printf '%s\n' "${assets[@]}" >&2
+            exit 1
+          fi
+
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
+              --verify-tag \
+              --title "Crystal Grotto ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi

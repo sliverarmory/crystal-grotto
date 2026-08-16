@@ -15,13 +15,20 @@ import (
 )
 
 const (
-	// Version is the Crystal Grotto application version.
-	Version = "0.1.0"
+	// Version is the default Crystal Grotto application version.
+	Version = "0.0.1"
 	// CompatibilityBaseline identifies the pinned upstream source distribution.
 	CompatibilityBaseline = "2026-07-16"
 	// UpstreamVersion is the version string reported by that distribution.
 	UpstreamVersion = "06.29.26"
 )
+
+// applicationVersion is linker-overridden from a pushed release tag. Keeping
+// Version constant preserves the public library contract for source builds.
+var applicationVersion = Version
+
+// ApplicationVersion returns the version embedded in this binary.
+func ApplicationVersion() string { return applicationVersion }
 
 type (
 	// Metadata describes a specification.

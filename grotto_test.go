@@ -39,7 +39,7 @@ func TestPublicParseAndRun(t *testing.T) {
 
 func TestVersionConstants(t *testing.T) {
 	t.Parallel()
-	if grotto.Version == "" || grotto.UpstreamVersion != "06.29.26" || grotto.CompatibilityBaseline != "2026-07-16" {
+	if grotto.Version != "0.0.1" || grotto.ApplicationVersion() != grotto.Version || grotto.UpstreamVersion != "06.29.26" || grotto.CompatibilityBaseline != "2026-07-16" {
 		t.Fatalf("unexpected versions: %q, %q, %q", grotto.Version, grotto.UpstreamVersion, grotto.CompatibilityBaseline)
 	}
 }

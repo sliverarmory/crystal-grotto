@@ -29,12 +29,12 @@ func NewRootCommand(streams Streams) *cobra.Command {
 	command := &cobra.Command{
 		Use:           "crystal-grotto",
 		Short:         "Build and transform position-independent Windows programs",
-		Version:       grotto.Version,
+		Version:       grotto.ApplicationVersion(),
 		SilenceErrors: true,
 		SilenceUsage:  true,
 		Args:          cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			fmt.Fprintf(command.OutOrStdout(), "Crystal Grotto %s (Crystal Palace compatibility %s)\n\n", grotto.Version, grotto.UpstreamVersion)
+			fmt.Fprintf(command.OutOrStdout(), "Crystal Grotto %s (Crystal Palace compatibility %s)\n\n", grotto.ApplicationVersion(), grotto.UpstreamVersion)
 			return command.Help()
 		},
 		CompletionOptions: cobra.CompletionOptions{DisableDefaultCmd: true},
