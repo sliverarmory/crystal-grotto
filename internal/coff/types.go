@@ -170,6 +170,7 @@ func (o *Object) AddSymbol(symbol *Symbol) error {
 
 // RemoveSymbols removes named symbols without disturbing the remaining order.
 func (o *Object) RemoveSymbols(names map[string]struct{}) {
+	o.ensureIndexes()
 	kept := o.Symbols[:0]
 	for _, symbol := range o.Symbols {
 		if _, remove := names[symbol.Name]; remove {
@@ -179,6 +180,22 @@ func (o *Object) RemoveSymbols(names map[string]struct{}) {
 		kept = append(kept, symbol)
 	}
 	o.Symbols = kept
+}
+
+// RemoveSections removes named sections without reordering the sections that
+// remain. Callers are responsible for removing symbols and relocations that
+// reference a removed section before invoking this method.
+func (o *Object) RemoveSections(names map[string]struct{}) {
+	o.ensureIndexes()
+	kept := o.Sections[:0]
+	for _, section := range o.Sections {
+		if _, remove := names[section.Name]; remove {
+			delete(o.sectionsByName, section.Name)
+			continue
+		}
+		kept = append(kept, section)
+	}
+	o.Sections = kept
 }
 
 // RemapSymbol renames a symbol and every relocation that refers to it.

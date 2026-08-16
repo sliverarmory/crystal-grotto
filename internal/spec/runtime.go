@@ -108,6 +108,13 @@ type RuleProvider interface {
 	GeneratedRules() ([]byte, error)
 }
 
+// RuleGenerationRequester is implemented by handlers that need an explicit
+// signal before execution when the caller selected RunAndGenerate. Upstream
+// uses the presence of a global rule-output handle for the same purpose.
+type RuleGenerationRequester interface {
+	RequestRuleGeneration()
+}
+
 // ExecutionContext exposes controlled VM state to a linker command handler.
 type ExecutionContext struct{ vm *vm }
 
@@ -163,6 +170,9 @@ func (s *Spec) Run(capability Capability, options RunOptions) ([]byte, error) {
 // RunAndGenerate executes a spec and returns program/rule outputs. Rule output is
 // populated by linker handlers that support rule generation.
 func (s *Spec) RunAndGenerate(capability Capability, options RunOptions) (Result, error) {
+	if requester, ok := options.Handler.(RuleGenerationRequester); ok {
+		requester.RequestRuleGeneration()
+	}
 	program, err := s.Run(capability, options)
 	if err != nil {
 		return Result{}, err

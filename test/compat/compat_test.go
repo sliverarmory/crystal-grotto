@@ -81,15 +81,17 @@ func TestMinGWCOFFCompatibility(t *testing.T) {
 	}
 	root := repositoryRoot(t)
 	fixtureRoot := filepath.Join(root, "testdata", "modules", "coff")
-	specPath := filepath.Join(fixtureRoot, "pic.spec")
 	for _, test := range []struct {
 		name     string
 		compiler string
 		source   string
+		spec     string
 		want     []byte
 	}{
-		{name: "x86", compiler: "i686-w64-mingw32-gcc", source: "basic.x86.S", want: []byte{0xb8, 0x2a, 0, 0, 0, 0xc3, 0x90, 0x90}},
-		{name: "x64", compiler: "x86_64-w64-mingw32-gcc", source: "basic.x64.S", want: []byte{0xb8, 0x2a, 0, 0, 0, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90}},
+		{name: "x86", compiler: "i686-w64-mingw32-gcc", source: "basic.x86.S", spec: "pic.spec", want: []byte{0xb8, 0x2a, 0, 0, 0, 0xc3, 0x90, 0x90}},
+		{name: "x64", compiler: "x86_64-w64-mingw32-gcc", source: "basic.x64.S", spec: "pic.spec", want: []byte{0xb8, 0x2a, 0, 0, 0, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90}},
+		{name: "x64_relax", compiler: "x86_64-w64-mingw32-gcc", source: "relax.x64.S", spec: "relax.spec"},
+		{name: "x64_fixbss", compiler: "x86_64-w64-mingw32-gcc", source: "fixbss.x64.S", spec: "fixbss.spec"},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
@@ -108,6 +110,7 @@ func TestMinGWCOFFCompatibility(t *testing.T) {
 
 			grottoOutput := filepath.Join(workDir, "grotto.pic")
 			palaceOutput := filepath.Join(workDir, "palace.pic")
+			specPath := filepath.Join(fixtureRoot, test.spec)
 			grottoStdout, grottoStderr, err := run(grottoBin, workDir, "link", specPath, objectPath, grottoOutput)
 			if err != nil {
 				t.Fatalf("Crystal Grotto failed: %v\nstdout:\n%s\nstderr:\n%s", err, grottoStdout, grottoStderr)
@@ -123,11 +126,14 @@ func TestMinGWCOFFCompatibility(t *testing.T) {
 
 			grottoBytes := readOutput(t, grottoOutput)
 			palaceBytes := readOutput(t, palaceOutput)
-			if !bytes.Equal(grottoBytes, test.want) {
+			if test.want != nil && !bytes.Equal(grottoBytes, test.want) {
 				t.Fatalf("Crystal Grotto PIC = %x, want %x", grottoBytes, test.want)
 			}
-			if !bytes.Equal(palaceBytes, test.want) {
+			if test.want != nil && !bytes.Equal(palaceBytes, test.want) {
 				t.Fatalf("Crystal Palace PIC = %x, want %x", palaceBytes, test.want)
+			}
+			if !bytes.Equal(grottoBytes, palaceBytes) {
+				t.Fatalf("binary output differs\nGrotto: %x\nPalace: %x", grottoBytes, palaceBytes)
 			}
 		})
 	}

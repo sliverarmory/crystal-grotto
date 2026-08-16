@@ -31,7 +31,7 @@ func (h *Handler) handleMergeLibrary(context *spec.ExecutionContext, command *sp
 	}
 	defer archive.Close()
 
-	members := make([]linker.LibraryMember, 0, len(archive.File))
+	objects := make([]*coff.Object, 0, len(archive.File)+1)
 	for _, entry := range archive.File {
 		if entry.UncompressedSize64 > uint64(maximumLibraryMemberBytes) {
 			return fmt.Errorf("COFF library member %q is %d bytes; maximum is %d", entry.Name, entry.UncompressedSize64, maximumLibraryMemberBytes)
@@ -58,14 +58,25 @@ func (h *Handler) handleMergeLibrary(context *spec.ExecutionContext, command *sp
 		if object.Architecture() != context.Arch() {
 			return fmt.Errorf("%s COFF arch differs from %s .spec target", object.Architecture(), context.Target())
 		}
-		members = append(members, linker.LibraryMember{Name: entry.Name, Object: object})
+		objects = append(objects, object)
 	}
 
 	artifact, value, err := popArtifact(context)
 	if err != nil {
 		return err
 	}
-	merged, _, err := linker.MergeLibrary(artifact.object, members)
+	if artifact.hasOption("+relax") {
+		for _, object := range objects {
+			if _, err := coff.RelaxReferencePointers(object); err != nil {
+				return err
+			}
+		}
+	}
+	// Upstream reads every ZIP entry and lets COFFMerge skip only objects whose
+	// external definitions are already represented. It does not use the usual
+	// unresolved-symbol archive selection algorithm.
+	objects = append([]*coff.Object{artifact.object}, objects...)
+	merged, err := linker.Merge(objects...)
 	if err != nil {
 		return err
 	}

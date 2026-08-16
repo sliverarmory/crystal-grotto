@@ -16,6 +16,8 @@ import (
 	"github.com/sliverarmory/crystal-grotto/internal/coff"
 	"github.com/sliverarmory/crystal-grotto/internal/coffwrite"
 	"github.com/sliverarmory/crystal-grotto/internal/linker"
+	"github.com/sliverarmory/crystal-grotto/internal/rulegen"
+	"github.com/sliverarmory/crystal-grotto/internal/spec"
 	"github.com/sliverarmory/crystal-grotto/internal/x86"
 )
 
@@ -36,17 +38,21 @@ func defaultDisassemblerFactory(ctx context.Context, machine coff.Machine) (x86.
 	return x86.NewCapstone(ctx, mode)
 }
 
-func (h *Handler) export(artifact *Artifact) ([]byte, error) {
+func (h *Handler) export(execution *spec.ExecutionContext, artifact *Artifact) ([]byte, error) {
 	if artifact == nil || artifact.object == nil {
 		return nil, errors.New("engine: cannot export a nil object")
 	}
 	if err := artifact.unsupportedError(); err != nil {
 		return nil, err
 	}
-	h.setRuleGenerationResult(artifact.ruleGenerationError())
-
 	normalized, err := linker.Merge(artifact.object)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := btf.ApplyEasyPICFixes(context.Background(), normalized, btf.EasyPICOptions{
+		GetBSS:        artifact.config.getBSS,
+		ReturnAddress: artifact.config.returnAddress,
+	}); err != nil {
 		return nil, err
 	}
 	if err := h.applyOrderTransforms(artifact, normalized); err != nil {
@@ -56,6 +62,9 @@ func (h *Handler) export(artifact *Artifact) ([]byte, error) {
 		return nil, err
 	}
 	if err := applyPatches(normalized, artifact.config.patches); err != nil {
+		return nil, err
+	}
+	if err := h.generateRulesFor(execution, artifact, normalized); err != nil {
 		return nil, err
 	}
 
@@ -96,6 +105,27 @@ func (h *Handler) export(artifact *Artifact) ([]byte, error) {
 	default:
 		return nil, fmt.Errorf("engine: unknown artifact type %q", artifact.kind)
 	}
+}
+
+func (h *Handler) generateRulesFor(execution *spec.ExecutionContext, artifact *Artifact, object *coff.Object) error {
+	if !h.ruleGenerationRequested() {
+		return nil
+	}
+	if execution == nil {
+		return errors.New("engine: cannot generate rules without an execution context")
+	}
+	arguments, err := rulegen.ParseArgs(artifact.config.ruleArguments)
+	if err != nil {
+		h.appendRuleGeneration(rulegen.Result{}, err)
+		return err
+	}
+	options := h.ruleOptions
+	if options.Random == nil {
+		options.Random = h.random
+	}
+	result, err := rulegen.Generate(context.Background(), object, execution.Metadata(), arguments, options)
+	h.appendRuleGeneration(result, err)
+	return err
 }
 
 func (h *Handler) applyOrderTransforms(artifact *Artifact, object *coff.Object) error {

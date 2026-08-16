@@ -54,18 +54,21 @@ type DeferredCommand struct {
 
 // Configuration is a defensive snapshot of an Artifact's export settings.
 type Configuration struct {
-	Entry       string
-	EntrySet    bool
-	Options     []string
-	Strip       []string
-	Patches     []Patch
-	Links       []linker.LinkedSection
-	APIs        []string
-	Exports     []linker.Export
-	Magic       []uint32
-	COFFParse   *DiagnosticOutput
-	Disassemble *DiagnosticOutput
-	Deferred    []DeferredCommand
+	Entry         string
+	EntrySet      bool
+	Options       []string
+	Strip         []string
+	Patches       []Patch
+	Links         []linker.LinkedSection
+	APIs          []string
+	Exports       []linker.Export
+	Magic         []uint32
+	RuleArguments []string
+	GetBSS        string
+	ReturnAddress string
+	COFFParse     *DiagnosticOutput
+	Disassemble   *DiagnosticOutput
+	Deferred      []DeferredCommand
 }
 
 // Artifact is the object value carried on the specification VM stack.
@@ -84,14 +87,17 @@ type artifactConfig struct {
 	options map[string]struct{}
 	strip   map[string]struct{}
 
-	patches     []Patch
-	patchIndex  map[string]int
-	links       []linker.LinkedSection
-	linkIndex   map[string]int
-	apis        []string
-	exports     []linker.Export
-	exportIndex map[string]int
-	magic       []uint32
+	patches       []Patch
+	patchIndex    map[string]int
+	links         []linker.LinkedSection
+	linkIndex     map[string]int
+	apis          []string
+	exports       []linker.Export
+	exportIndex   map[string]int
+	magic         []uint32
+	ruleArguments []string
+	getBSS        string
+	returnAddress string
 
 	coffParse   *DiagnosticOutput
 	disassemble *DiagnosticOutput
@@ -149,18 +155,21 @@ func (a *Artifact) Configuration() Configuration {
 		return Configuration{}
 	}
 	configuration := Configuration{
-		Entry:       a.config.entry,
-		EntrySet:    a.config.entrySet,
-		Options:     sortedKeys(a.config.options),
-		Strip:       sortedKeys(a.config.strip),
-		Patches:     clonePatches(a.config.patches),
-		Links:       cloneLinks(a.config.links),
-		APIs:        append([]string(nil), a.config.apis...),
-		Exports:     append([]linker.Export(nil), a.config.exports...),
-		Magic:       append([]uint32(nil), a.config.magic...),
-		COFFParse:   cloneDiagnostic(a.config.coffParse),
-		Disassemble: cloneDiagnostic(a.config.disassemble),
-		Deferred:    cloneDeferred(a.config.deferred),
+		Entry:         a.config.entry,
+		EntrySet:      a.config.entrySet,
+		Options:       sortedKeys(a.config.options),
+		Strip:         sortedKeys(a.config.strip),
+		Patches:       clonePatches(a.config.patches),
+		Links:         cloneLinks(a.config.links),
+		APIs:          append([]string(nil), a.config.apis...),
+		Exports:       append([]linker.Export(nil), a.config.exports...),
+		Magic:         append([]uint32(nil), a.config.magic...),
+		RuleArguments: append([]string(nil), a.config.ruleArguments...),
+		GetBSS:        a.config.getBSS,
+		ReturnAddress: a.config.returnAddress,
+		COFFParse:     cloneDiagnostic(a.config.coffParse),
+		Disassemble:   cloneDiagnostic(a.config.disassemble),
+		Deferred:      cloneDeferred(a.config.deferred),
 	}
 	return configuration
 }
@@ -218,6 +227,10 @@ func (a *Artifact) deferCommand(command DeferredCommand) {
 	a.config.deferred = append(a.config.deferred, command)
 }
 
+func (a *Artifact) setRuleArguments(arguments []string) {
+	a.config.ruleArguments = append([]string(nil), arguments...)
+}
+
 // ErrUnsupported identifies a configured feature whose implementation is not
 // present. errors.Is can be used without matching error text.
 var ErrUnsupported = errors.New("engine feature is not implemented")
@@ -254,19 +267,11 @@ func (a *Artifact) unsupportedError() error {
 	return &UnsupportedError{Features: sortedKeys(features)}
 }
 
-func (a *Artifact) ruleGenerationError() error {
-	for _, command := range a.config.deferred {
-		if command.Name == "rule" {
-			return &UnsupportedError{Features: []string{"YARA rule generation"}}
-		}
-	}
-	return nil
-}
-
 var supportedTransformOptions = map[string]struct{}{
 	"+disco":    {},
 	"+gofirst":  {},
 	"+optimize": {},
+	"+relax":    {},
 }
 
 func sortedKeys(values map[string]struct{}) []string {

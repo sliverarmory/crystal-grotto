@@ -9,9 +9,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/sliverarmory/crystal-grotto/internal/coff"
 	"github.com/sliverarmory/crystal-grotto/internal/coffwrite"
@@ -188,7 +190,14 @@ func TestHandlerMergeAndMergeLibrary(t *testing.T) {
 			Section: text, VirtualAddress: 1, SymbolName: "helper", Symbol: undefined, Type: coff.RelAMD64Rel32,
 		})
 		libraryObject := textObject(t, coff.MachineAMD64, []byte{0xc3}, function("helper", 0))
-		writeZIP(t, filepath.Join(directory, "helpers.zip"), "helper.o", marshalTestObject(t, libraryObject))
+		unreferenced := textObject(t, coff.MachineAMD64, []byte{0xcc, 0xc3}, function("also_merged", 0))
+		unreferenced.GetSection(".text").Name = ".text$also_merged"
+		unreferenced.GetSection(".text").OriginalName = ".text$also_merged"
+		unreferenced.GetSymbol(".text").Name = ".text$also_merged"
+		writeZIPMembers(t, filepath.Join(directory, "helpers.zip"), map[string][]byte{
+			"helper.o":       marshalTestObject(t, libraryObject),
+			"unreferenced.o": marshalTestObject(t, unreferenced),
+		})
 
 		output := runEngineSpecFile(t, filepath.Join(directory, "merge.spec"), "x64", `x64:
   push $BASE
@@ -207,11 +216,48 @@ func TestHandlerMergeAndMergeLibrary(t *testing.T) {
 		if len(parsed.GetSection(".text").Relocations) != 0 {
 			t.Fatalf("same-section library relocation was not resolved: %#v", parsed.GetSection(".text").Relocations)
 		}
+		if symbol := parsed.GetSymbol("also_merged"); symbol == nil || symbol.Section != parsed.GetSection(".text") {
+			t.Fatalf("unreferenced ZIP member was not merged: %#v", symbol)
+		}
 	})
 }
 
 func TestHandlerOrderOptionsAndUnsupportedConfiguration(t *testing.T) {
 	t.Parallel()
+
+	t.Run("relax", func(t *testing.T) {
+		t.Parallel()
+		object := refptrObject(t)
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make coff +relax
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+		parsed, err := coff.Parse(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := parsed.GetSection(".text")
+		if text == nil || len(text.Data) < 2 || text.Data[1] != 0x8d {
+			t.Fatalf("relaxed .text = %#v", text)
+		}
+		if parsed.GetSymbol(".refptr.target") != nil || parsed.GetSection(".rdata$.refptr.target") != nil {
+			t.Fatal("relaxed refptr artifacts remain")
+		}
+	})
+
+	t.Run("relax rejects x86", func(t *testing.T) {
+		t.Parallel()
+		object := textObject(t, coff.MachineI386, []byte{0xc3}, function("_go", 0))
+		err := runEngineSpecError(t, "x86", `x86:
+  push $INPUT
+  make coff +relax
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+		if !strings.Contains(err.Error(), "+relax is x64 only") {
+			t.Fatalf("error = %v", err)
+		}
+	})
 
 	t.Run("gofirst", func(t *testing.T) {
 		t.Parallel()
@@ -267,7 +313,60 @@ func TestHandlerOrderOptionsAndUnsupportedConfiguration(t *testing.T) {
 	})
 }
 
-func TestHandlerRulesAreRequestedOnlyByRuleCommand(t *testing.T) {
+func TestHandlerEasyPICFixes(t *testing.T) {
+	t.Parallel()
+
+	t.Run("x64 bss references", func(t *testing.T) {
+		t.Parallel()
+		object := textObject(t, coff.MachineAMD64,
+			[]byte{0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3, 0xc3},
+			function("go", 0), function("getbss", 8),
+		)
+		bss := coff.NewSection(".bss", make([]byte, 32))
+		if err := object.AddSection(bss); err != nil {
+			t.Fatal(err)
+		}
+		text := object.GetSection(".text")
+		bssSymbol := object.GetSymbol(".bss")
+		text.Relocations = []*coff.Relocation{{
+			Section: text, VirtualAddress: 3, SymbolName: bssSymbol.Name,
+			Symbol: bssSymbol, Type: coff.RelAMD64Rel32,
+		}}
+
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic
+  fixbss "getbss"
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+		want := []byte{
+			0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+			0x48, 0x83, 0xec, 0x28, 0xb9, 0x20, 0, 0, 0, 0xe8, 0x12, 0, 0, 0,
+			0x48, 0x83, 0xc4, 0x28, 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58,
+			0x5a, 0x59, 0x48, 0x8b, 0, 0xc3, 0xc3,
+		}
+		if !bytes.Equal(output, want) {
+			t.Fatalf("fixbss PIC = %x\nwant = %x", output, want)
+		}
+	})
+
+	t.Run("command validation", func(t *testing.T) {
+		t.Parallel()
+		x64 := textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0))
+		err := runEngineSpecError(t, "x64", "x64:\n  push $INPUT\n  make coff\n  fixbss \"go\"\n", spec.Environment{"$INPUT": marshalTestObject(t, x64)}, New())
+		if !strings.Contains(err.Error(), "fixbss [symbol] is PIC-only") {
+			t.Fatalf("fixbss error = %v", err)
+		}
+
+		x86 := textObject(t, coff.MachineI386, []byte{0xc3}, function("_go", 0))
+		err = runEngineSpecError(t, "x86", "x86:\n  push $INPUT\n  make coff\n  fixptrs \"_go\"\n", spec.Environment{"$INPUT": marshalTestObject(t, x86)}, New())
+		if !strings.Contains(err.Error(), "fixptrs [_symbol] is x86 PIC-only") {
+			t.Fatalf("fixptrs error = %v", err)
+		}
+	})
+}
+
+func TestHandlerRunAndGenerateRules(t *testing.T) {
 	t.Parallel()
 	capability, err := spec.None("x64")
 	if err != nil {
@@ -305,16 +404,45 @@ func TestHandlerRulesAreRequestedOnlyByRuleCommand(t *testing.T) {
 		}
 	})
 
-	t.Run("rule requested", func(t *testing.T) {
+	t.Run("default arguments", func(t *testing.T) {
 		handler := New()
-		object := marshalTestObject(t, textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0)))
-		program, err := spec.Parse("rules.spec", "x64:\n  push $INPUT\n  make pic\n  rule \"sample\"\n  export\n")
+		handler.ruleOptions.UUID = func() (string, error) { return "12345678-1234-4234-8234-123456789abc", nil }
+		handler.ruleOptions.Clock = func() time.Time { return time.Date(2025, time.January, 2, 0, 0, 0, 0, time.UTC) }
+		object := marshalTestObject(t, ruleObject(t))
+		program, err := spec.Parse("rules.spec", "name \"Engine Rules\"\nx64:\n  push $INPUT\n  make pic\n  export\n")
 		if err != nil {
 			t.Fatal(err)
 		}
-		_, err = program.RunAndGenerate(capability, spec.RunOptions{Environment: spec.Environment{"$INPUT": object}, Handler: handler})
-		if err == nil || !strings.Contains(err.Error(), "YARA rule generation") {
-			t.Fatalf("error = %v, want YARA unsupported error", err)
+		result, err := program.RunAndGenerate(capability, spec.RunOptions{Environment: spec.Environment{"$INPUT": object}, Handler: handler})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(result.Rules, []byte("rule Engine_Rules_12345678")) || !bytes.Contains(result.Rules, []byte("E8 ?? ?? ?? ??")) {
+			t.Fatalf("generated rules =\n%s", result.Rules)
+		}
+	})
+
+	t.Run("rule command overrides defaults but regular Run stays quiet", func(t *testing.T) {
+		handler := New()
+		handler.ruleOptions.UUID = func() (string, error) { return "abcdef01-1234-4234-8234-123456789abc", nil }
+		object := marshalTestObject(t, ruleObject(t))
+		program, err := spec.Parse("rules.spec", "x64:\n  push $INPUT\n  make pic\n  rule \"sample\" 1 1 \"3-16\"\n  export\n")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := program.Run(capability, spec.RunOptions{Environment: spec.Environment{"$INPUT": object}, Handler: handler}); err != nil {
+			t.Fatal(err)
+		}
+		quiet, err := handler.GeneratedRules()
+		if err != nil || len(quiet) != 0 {
+			t.Fatalf("regular Run rules = %q, err=%v", quiet, err)
+		}
+		result, err := program.RunAndGenerate(capability, spec.RunOptions{Environment: spec.Environment{"$INPUT": object}, Handler: handler})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(result.Rules, []byte("rule sample_abcdef01")) || bytes.Count(result.Rules, []byte("$r")) != 1 {
+			t.Fatalf("generated rules =\n%s", result.Rules)
 		}
 	})
 }
@@ -410,6 +538,8 @@ func TestArtifactConfigurationIsDefensiveAndDeterministic(t *testing.T) {
 	artifact.addStrip([]string{"z", "a", "z"})
 	artifact.setPatch("go", []byte{1})
 	artifact.setLink(linker.LinkedSection{Name: "blob", Data: []byte{2}})
+	artifact.config.getBSS = "getbss"
+	artifact.config.returnAddress = "getret"
 	artifact.deferCommand(DeferredCommand{Name: "protect", Arguments: []string{"go"}, AffectsProgram: true})
 
 	configuration := artifact.Configuration()
@@ -423,7 +553,8 @@ func TestArtifactConfigurationIsDefensiveAndDeterministic(t *testing.T) {
 	configuration.Links[0].Data[0] = 9
 	configuration.Deferred[0].Arguments[0] = "changed"
 	again := artifact.Configuration()
-	if again.Patches[0].Data[0] != 1 || again.Links[0].Data[0] != 2 || again.Deferred[0].Arguments[0] != "go" {
+	if again.Patches[0].Data[0] != 1 || again.Links[0].Data[0] != 2 || again.Deferred[0].Arguments[0] != "go" ||
+		again.GetBSS != "getbss" || again.ReturnAddress != "getret" {
 		t.Fatalf("Configuration exposed mutable storage: %#v", again)
 	}
 }
@@ -542,16 +673,49 @@ func runEngineSpecError(t *testing.T, arch, content string, environment spec.Env
 	return err
 }
 
-func writeZIP(t *testing.T, path, name string, data []byte) {
+func refptrObject(t *testing.T) *coff.Object {
+	t.Helper()
+	object := textObject(t, coff.MachineAMD64, []byte{0x48, 0x8b, 0x05, 0, 0, 0, 0, 0xc3, 0xc3}, function("go", 0), function("target", 8))
+	refptr := coff.NewSection(".rdata$.refptr.target", make([]byte, 8))
+	if err := object.AddSection(refptr); err != nil {
+		t.Fatal(err)
+	}
+	refptrSymbol := coff.NewDataSymbol(refptr, ".refptr.target", 0)
+	if err := object.AddSymbol(refptrSymbol); err != nil {
+		t.Fatal(err)
+	}
+	text := object.GetSection(".text")
+	text.Relocations = append(text.Relocations, &coff.Relocation{
+		Section: text, VirtualAddress: 3, SymbolName: refptrSymbol.Name, Symbol: refptrSymbol, Type: coff.RelAMD64Rel32,
+	})
+	return object
+}
+
+func ruleObject(t *testing.T) *coff.Object {
+	t.Helper()
+	return textObject(t, coff.MachineAMD64,
+		[]byte{0xeb, 0x0e, 0x48, 0x8b, 0x05, 1, 2, 3, 4, 0xe8, 1, 0, 0, 0, 0x31, 0xc0, 0xc3},
+		function("go", 0),
+	)
+}
+
+func writeZIPMembers(t *testing.T, path string, members map[string][]byte) {
 	t.Helper()
 	var buffer bytes.Buffer
 	archive := zip.NewWriter(&buffer)
-	entry, err := archive.Create(name)
-	if err != nil {
-		t.Fatal(err)
+	names := make([]string, 0, len(members))
+	for name := range members {
+		names = append(names, name)
 	}
-	if _, err := entry.Write(data); err != nil {
-		t.Fatal(err)
+	sort.Strings(names)
+	for _, name := range names {
+		entry, err := archive.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := entry.Write(members[name]); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := archive.Close(); err != nil {
 		t.Fatal(err)

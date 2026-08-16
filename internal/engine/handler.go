@@ -18,12 +18,14 @@ import (
 	"github.com/sliverarmory/crystal-grotto/internal/coff"
 	crystalhash "github.com/sliverarmory/crystal-grotto/internal/hash"
 	"github.com/sliverarmory/crystal-grotto/internal/linker"
+	"github.com/sliverarmory/crystal-grotto/internal/rulegen"
 	"github.com/sliverarmory/crystal-grotto/internal/spec"
 )
 
 var (
-	_ spec.CommandHandler = (*Handler)(nil)
-	_ spec.RuleProvider   = (*Handler)(nil)
+	_ spec.CommandHandler          = (*Handler)(nil)
+	_ spec.RuleProvider            = (*Handler)(nil)
+	_ spec.RuleGenerationRequester = (*Handler)(nil)
 )
 
 // Handler is the default request-local implementation of spec.CommandHandler.
@@ -34,9 +36,13 @@ type Handler struct {
 	newDisassembler disassemblerFactory
 	stdout          io.Writer
 	random          io.Reader
+	ruleOptions     rulegen.GenerateOptions
 
-	rulesMu  sync.Mutex
-	rulesErr error
+	rulesMu       sync.Mutex
+	generateRules bool
+	rules         []byte
+	ruleWarnings  []rulegen.Warning
+	rulesErr      error
 }
 
 // New constructs the default object/linker command handler.
@@ -58,13 +64,37 @@ func Factory() spec.CommandHandler { return New() }
 func (h *Handler) GeneratedRules() ([]byte, error) {
 	h.rulesMu.Lock()
 	defer h.rulesMu.Unlock()
-	return nil, h.rulesErr
+	h.generateRules = false
+	return append([]byte(nil), h.rules...), h.rulesErr
 }
 
-func (h *Handler) setRuleGenerationResult(err error) {
+// RequestRuleGeneration enables rule output for the next request-local
+// execution. It mirrors the global rulegen handle created by upstream's
+// runAndGenerate API.
+func (h *Handler) RequestRuleGeneration() {
 	h.rulesMu.Lock()
-	h.rulesErr = err
+	h.generateRules = true
+	h.rules = nil
+	h.ruleWarnings = nil
+	h.rulesErr = nil
 	h.rulesMu.Unlock()
+}
+
+func (h *Handler) ruleGenerationRequested() bool {
+	h.rulesMu.Lock()
+	defer h.rulesMu.Unlock()
+	return h.generateRules
+}
+
+func (h *Handler) appendRuleGeneration(result rulegen.Result, err error) {
+	h.rulesMu.Lock()
+	defer h.rulesMu.Unlock()
+	if err != nil {
+		h.rulesErr = err
+		return
+	}
+	h.rules = append(h.rules, result.YARA...)
+	h.ruleWarnings = append(h.ruleWarnings, result.Warnings...)
 }
 
 // Handle implements deterministic Crystal Palace object commands.
@@ -87,7 +117,7 @@ func (h *Handler) Handle(context *spec.ExecutionContext, command *spec.Command, 
 		if err != nil {
 			return true, err
 		}
-		output, err := h.export(artifact)
+		output, err := h.export(context, artifact)
 		if err != nil {
 			return true, err
 		}
@@ -144,8 +174,20 @@ func (h *Handler) Handle(context *spec.ExecutionContext, command *spec.Command, 
 	case "reladdr":
 		return true, errors.New("reladdr is removed. Use fixptrs to avoid the x86 address hacks")
 	case "rule":
-		return true, deferArtifactCommand(context, command, arguments, false)
-	case "fixptrs", "fixbss", "dfr", "attach", "redirect", "addhook", "filterhooks", "preserve", "protect", "optout", "intrinsic", "catch", "ised", "linkpost":
+		parsed, err := rulegen.ParseArgs(arguments)
+		if err != nil {
+			return true, err
+		}
+		_ = parsed // Parsing here preserves command-time validation.
+		return true, mutateArtifact(context, func(artifact *Artifact) error {
+			artifact.setRuleArguments(arguments)
+			return nil
+		})
+	case "fixptrs":
+		return true, h.handleFixPointers(context, command, arguments)
+	case "fixbss":
+		return true, h.handleFixBSS(context, command, arguments)
+	case "dfr", "attach", "redirect", "addhook", "filterhooks", "preserve", "protect", "optout", "intrinsic", "catch", "ised", "linkpost":
 		if err := h.validateDeferred(context, command, arguments); err != nil {
 			return true, err
 		}
@@ -182,6 +224,11 @@ func (h *Handler) handleMake(context *spec.ExecutionContext, command *spec.Comma
 	if object.Architecture() != context.Arch() {
 		return fmt.Errorf("%s COFF arch differs from %s .spec target", object.Architecture(), context.Target())
 	}
+	if command.HasOption("+relax") {
+		if _, err := coff.RelaxReferencePointers(object); err != nil {
+			return err
+		}
+	}
 	artifact := newArtifact(kind, object)
 	artifact.addOptions(command.Options())
 	context.Push(spec.StackValue{Object: artifact, Source: value.Source})
@@ -207,6 +254,11 @@ func (h *Handler) handleMerge(context *spec.ExecutionContext, command *spec.Comm
 	if err != nil {
 		return err
 	}
+	if artifact.hasOption("+relax") {
+		if _, err := coff.RelaxReferencePointers(additional); err != nil {
+			return err
+		}
+	}
 	merged, err := linker.Merge(artifact.object, additional)
 	if err != nil {
 		return err
@@ -225,13 +277,45 @@ func (h *Handler) handlePatch(context *spec.ExecutionContext, command *spec.Comm
 		return err
 	}
 	return mutateArtifact(context, func(artifact *Artifact) error {
-		if context.Arch() == "x86" && (artifact.kind == KindPIC || artifact.kind == KindPIC64) {
+		if context.Arch() == "x86" && (artifact.kind == KindPIC || artifact.kind == KindPIC64) && artifact.config.returnAddress == "" {
 			return errors.New("x86 PIC requires fixptrs is set to use patch")
 		}
 		if err := validatePatch(artifact.object, arguments[0], data); err != nil {
 			return err
 		}
 		artifact.setPatch(arguments[0], data)
+		return nil
+	})
+}
+
+func (h *Handler) handleFixPointers(context *spec.ExecutionContext, command *spec.Command, arguments []string) error {
+	if err := requireArguments(command.Name(), arguments, 1, 1); err != nil {
+		return err
+	}
+	return mutateArtifact(context, func(artifact *Artifact) error {
+		if context.Arch() != "x86" || artifact.kind != KindPIC {
+			return errors.New("fixptrs [_symbol] is x86 PIC-only")
+		}
+		if _, err := requireFunction(artifact.object, arguments[0]); err != nil {
+			return err
+		}
+		artifact.config.returnAddress = arguments[0]
+		return nil
+	})
+}
+
+func (h *Handler) handleFixBSS(context *spec.ExecutionContext, command *spec.Command, arguments []string) error {
+	if err := requireArguments(command.Name(), arguments, 1, 1); err != nil {
+		return err
+	}
+	return mutateArtifact(context, func(artifact *Artifact) error {
+		if artifact.kind != KindPIC && artifact.kind != KindPIC64 {
+			return errors.New("fixbss [symbol] is PIC-only")
+		}
+		if _, err := requireFunction(artifact.object, arguments[0]); err != nil {
+			return err
+		}
+		artifact.config.getBSS = arguments[0]
 		return nil
 	})
 }
