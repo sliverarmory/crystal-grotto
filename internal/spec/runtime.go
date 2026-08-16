@@ -14,8 +14,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Environment holds byte variables ($NAME) and string variables (%name).
@@ -125,6 +127,9 @@ func (c *ExecutionContext) Environment() Environment { return c.vm.session.env }
 func (c *ExecutionContext) Pop() (StackValue, error) { return c.vm.pop() }
 func (c *ExecutionContext) Push(value StackValue)    { c.vm.push(value) }
 func (c *ExecutionContext) Peek() *StackValue        { return c.vm.peek() }
+
+// LogWarning emits an upstream-style warning at the current file and target.
+func (c *ExecutionContext) LogWarning(text string) { c.vm.log(MessageWarning, text) }
 func (c *ExecutionContext) ResolveFile(path string) (string, error) {
 	return c.vm.resolveInputFile(path)
 }
@@ -145,7 +150,7 @@ type Result struct {
 
 // Run executes a specification and requires exactly one byte value on the stack.
 func (s *Spec) Run(capability Capability, options RunOptions) ([]byte, error) {
-	session := newSession(capability, options)
+	session := newSession(capability, options, true)
 	metadata := s.metadata
 	root := &vm{spec: s, session: session, arch: capability.Arch, capabilityLabel: capability.Label, locals: make(map[string]string), metadata: &metadata}
 	if err := root.runTarget(""); err != nil {
@@ -190,7 +195,7 @@ func (s *Spec) RunAndGenerate(capability Capability, options RunOptions) (Result
 
 // RunConfig executes a configuration specification and requires an empty stack.
 func (s *Spec) RunConfig(capability Capability, options RunOptions) (Environment, error) {
-	session := newSession(capability, options)
+	session := newSession(capability, options, false)
 	metadata := s.metadata
 	root := &vm{spec: s, session: session, arch: capability.Arch, capabilityLabel: capability.Label, locals: make(map[string]string), metadata: &metadata}
 	if err := root.runTarget(""); err != nil {
@@ -208,15 +213,27 @@ type session struct {
 	logger    Logger
 	random    io.Reader
 	handler   CommandHandler
-	before    map[string][]hook
-	after     map[string][]hook
+	before    *hookRegistry
+	after     *hookRegistry
 	hookDepth int
 }
 
-func newSession(capability Capability, options RunOptions) *session {
+const (
+	environmentBeforeHooks = "__BEFORE"
+	environmentAfterHooks  = "__AFTER"
+)
+
+// newSession copies the top-level environment for ordinary program runs and
+// shares it for configuration runs. This mirrors LinkSpec.run and
+// LinkSpec.runConfig: configuration variables and hook registries persist,
+// while setg and byte-variable writes in an ordinary run do not mutate the
+// caller's map.
+func newSession(capability Capability, options RunOptions, copyEnvironment bool) *session {
 	env := options.Environment
 	if env == nil {
 		env = make(Environment)
+	} else if copyEnvironment {
+		env = cloneEnvironment(env)
 	}
 	if capability.HasCapability() {
 		env[capability.Key] = append([]byte(nil), capability.Contents...)
@@ -225,7 +242,14 @@ func newSession(capability Capability, options RunOptions) *session {
 	if random == nil {
 		random = rand.Reader
 	}
-	return &session{env: env, logger: options.Logger, random: random, handler: options.Handler, before: make(map[string][]hook), after: make(map[string][]hook)}
+	return &session{
+		env:     env,
+		logger:  options.Logger,
+		random:  random,
+		handler: options.Handler,
+		before:  environmentHookRegistry(env, environmentBeforeHooks),
+		after:   environmentHookRegistry(env, environmentAfterHooks),
+	}
 }
 
 type vm struct {
@@ -249,6 +273,36 @@ type hook struct {
 	action   *Command
 }
 
+// hookRegistry is stored by pointer in Environment so config specifications
+// can install hooks which later ordinary runs observe through their shallow
+// environment copy. The lock also makes concurrent hook consumers safe.
+type hookRegistry struct {
+	mu    sync.RWMutex
+	hooks map[string][]hook
+}
+
+func environmentHookRegistry(env Environment, key string) *hookRegistry {
+	if registry, ok := env[key].(*hookRegistry); ok && registry != nil {
+		return registry
+	}
+	registry := &hookRegistry{hooks: make(map[string][]hook)}
+	env[key] = registry
+	return registry
+}
+
+func (r *hookRegistry) add(command string, value hook) {
+	r.mu.Lock()
+	r.hooks[command] = append(r.hooks[command], value)
+	r.mu.Unlock()
+}
+
+func (r *hookRegistry) get(command string) []hook {
+	r.mu.RLock()
+	result := append([]hook(nil), r.hooks[command]...)
+	r.mu.RUnlock()
+	return result
+}
+
 func (v *vm) runTarget(name string) error {
 	target, err := v.callTarget(name)
 	if err != nil {
@@ -257,7 +311,7 @@ func (v *vm) runTarget(name string) error {
 	previous := v.target
 	v.target = target
 	defer func() { v.target = previous }()
-	if err := v.runHooks(v.session.before[""], nil, nil); err != nil {
+	if err := v.runHooks(v.session.before.get(""), nil, nil); err != nil {
 		return err
 	}
 	commands := v.spec.labels[target]
@@ -267,7 +321,7 @@ func (v *vm) runTarget(name string) error {
 			return err
 		}
 	}
-	return v.runHooks(v.session.after[""], nil, nil)
+	return v.runHooks(v.session.after.get(""), nil, nil)
 }
 
 func (v *vm) callTarget(name string) (string, error) {
@@ -291,7 +345,7 @@ func (v *vm) runCommand(commands []*Command, index *int) error {
 	}
 	v.lastVariables = resolved.Variables
 	args := resolved.Args
-	if err := v.runHooks(v.session.before[command.Name()], command, args); err != nil {
+	if err := v.runHooks(v.session.before.get(command.Name()), command, args); err != nil {
 		return err
 	}
 
@@ -302,7 +356,7 @@ func (v *vm) runCommand(commands []*Command, index *int) error {
 		if err := child.runTarget(strings.TrimPrefix(name, ".")); err != nil {
 			return err
 		}
-		return v.runHooks(v.session.after[name], command, args)
+		return v.runHooks(v.session.after.get(name), command, args)
 	}
 
 	handled := true
@@ -369,11 +423,14 @@ func (v *vm) runCommand(commands []*Command, index *int) error {
 		}
 		items := splitList(value)
 		for i, item := range items {
-			path := item
-			if !filepath.IsAbs(path) {
-				path = filepath.Join(filepath.Dir(v.spec.file), path)
+			path, err := v.resolveInputFile(item)
+			if err != nil {
+				return err
 			}
-			items[i], err = filepath.Abs(path)
+			absolute, err := filepath.Abs(path)
+			if err == nil {
+				items[i], err = filepath.EvalSymlinks(absolute)
+			}
 			if err != nil {
 				return v.programError(err.Error() + ": " + path)
 			}
@@ -461,9 +518,9 @@ func (v *vm) runCommand(commands []*Command, index *int) error {
 		(*index)++
 		h := makeHook(args, commands[*index])
 		if name == "before" {
-			v.session.before[h.command] = append(v.session.before[h.command], h)
+			v.session.before.add(h.command, h)
 		} else {
-			v.session.after[h.command] = append(v.session.after[h.command], h)
+			v.session.after.add(h.command, h)
 		}
 	case "foreach", "next":
 		if *index+1 >= len(commands) {
@@ -471,6 +528,9 @@ func (v *vm) runCommand(commands []*Command, index *int) error {
 		}
 		(*index)++
 		actionIndex := *index
+		if action := commands[actionIndex].Name(); action == "foreach" || action == "next" {
+			return v.programError("Nested foreach/next is not allowed")
+		}
 		if name == "foreach" {
 			for _, value := range splitList(args[0]) {
 				v.locals["%_"] = value
@@ -509,7 +569,7 @@ func (v *vm) runCommand(commands []*Command, index *int) error {
 			return v.programError("This is a bug? Did not process '" + command.Original() + "'")
 		}
 	}
-	return v.runHooks(v.session.after[command.Name()], command, args)
+	return v.runHooks(v.session.after.get(command.Name()), command, args)
 }
 
 func (v *vm) Resolve(name string) (string, error) {
@@ -665,6 +725,13 @@ func (v *vm) resolveInputFile(argument string) (string, error) {
 	if info.IsDir() {
 		return "", v.programError("File is a folder " + path)
 	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", v.programError("File is not readable " + path)
+	}
+	if err := file.Close(); err != nil {
+		return "", v.programError(err.Error())
+	}
 	return path, nil
 }
 
@@ -713,15 +780,33 @@ func positionalLocals(args []string) map[string]string {
 	return locals
 }
 
+var commaListPattern = regexp.MustCompile(`,[ \t\n\v\f\r]*`)
+
 func splitList(value string) []string {
 	if value == "" {
 		return nil
 	}
-	parts := strings.Split(value, ",")
+	parts := commaListPattern.Split(value, -1)
+	// Java's String.split(regex) discards all trailing empty fields before
+	// CrystalUtils.toList trims the remaining values.
+	for len(parts) > 0 && parts[len(parts)-1] == "" {
+		parts = parts[:len(parts)-1]
+	}
+	if len(parts) == 0 {
+		return nil
+	}
 	for index := range parts {
 		parts[index] = strings.TrimSpace(parts[index])
 	}
 	return parts
+}
+
+func cloneEnvironment(input Environment) Environment {
+	result := make(Environment, len(input))
+	for key, value := range input {
+		result[key] = value
+	}
+	return result
 }
 
 func cloneStrings(input map[string]string) map[string]string {

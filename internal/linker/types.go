@@ -40,12 +40,24 @@ func (e *Error) Error() string {
 
 func (e *Error) Unwrap() error { return e.Err }
 
-// LinkedSection is byte content supplied by a spec link/linkfunc command.
+// LinkedRelocation is one relocation carried by generated linked content.
+// Ordinary link/linkfunc byte blobs leave this slice empty. Post-link
+// resources such as generated unwind information retain their ADDR32NB
+// references through this representation.
+type LinkedRelocation struct {
+	VirtualAddress uint32
+	SymbolName     string
+	Type           uint16
+}
+
+// LinkedSection is content supplied by a spec link/linkfunc command or a
+// generated post-link resource.
 type LinkedSection struct {
-	Name       string
-	Data       []byte
-	Executable bool
-	Alignment  uint32
+	Name        string
+	Data        []byte
+	Executable  bool
+	Alignment   uint32
+	Relocations []LinkedRelocation
 }
 
 func (l LinkedSection) section() (*coff.Section, error) {
@@ -61,6 +73,20 @@ func (l LinkedSection) section() (*coff.Section, error) {
 	section.Alignment = l.Alignment
 	if section.Alignment == 0 {
 		section.Alignment = 1
+	}
+	for index, linked := range l.Relocations {
+		if linked.SymbolName == "" {
+			return nil, fmt.Errorf("linked relocation %d has an empty symbol name", index)
+		}
+		if uint64(linked.VirtualAddress)+4 > uint64(len(section.Data)) {
+			return nil, fmt.Errorf("linked relocation %d at %#x is outside %d-byte section", index, linked.VirtualAddress, len(section.Data))
+		}
+		section.Relocations = append(section.Relocations, &coff.Relocation{
+			Section:        section,
+			VirtualAddress: linked.VirtualAddress,
+			SymbolName:     linked.SymbolName,
+			Type:           linked.Type,
+		})
 	}
 	return section, nil
 }

@@ -36,8 +36,13 @@ type PICOOptions struct {
 	EntrySymbol  string
 	RequireEntry bool
 	Links        []LinkedSection
-	APIs         []string
-	Exports      []Export
+	// APIs retains declaration order. As in Crystal Palace, duplicate names are
+	// permitted and internal imports resolve to the first matching entry.
+	APIs []string
+	// Exports retains first-declaration order. Re-declaring a symbol with a
+	// different tag replaces its tag, matching the upstream export map while
+	// keeping the generated directive stream deterministic.
+	Exports []Export
 
 	// MaterializeBSS includes the zero-filled .bss bytes in the payload. The
 	// upstream-compatible default omits them and represents them only in the
@@ -221,7 +226,7 @@ func EmitPICO(object *coff.Object, options PICOOptions) (*PICOImage, error) {
 	var patchups []picoPatchup
 	for _, placement := range codeLayout.Placements {
 		for _, relocation := range placement.Section.Relocations {
-			patchup, keep, err := applyPICORelocation(object.Machine, picoCode, codeLayout, dataLayout, image.Code, linkedByName, importsBySymbol, placement, relocation)
+			patchup, keep, err := applyPICORelocation(object, object.Machine, picoCode, codeLayout, dataLayout, image.Code, linkedByName, importsBySymbol, placement, relocation)
 			if err != nil {
 				return nil, err
 			}
@@ -237,7 +242,7 @@ func EmitPICO(object *coff.Object, options PICOOptions) (*PICOImage, error) {
 			if placement.Sparse {
 				return nil, &Error{Stage: "PICO data relocation", Section: placement.Section.Name, Relocation: relocation, Err: errors.New("sparse .bss contains a relocation")}
 			}
-			patchup, keep, err := applyPICORelocation(object.Machine, picoData, codeLayout, dataLayout, image.Data, linkedByName, importsBySymbol, placement, relocation)
+			patchup, keep, err := applyPICORelocation(object, object.Machine, picoData, codeLayout, dataLayout, image.Data, linkedByName, importsBySymbol, placement, relocation)
 			if err != nil {
 				return nil, err
 			}
@@ -286,6 +291,8 @@ func discoverPICOImports(machine coff.Machine, code *Layout) ([]*picoImport, map
 	for _, placement := range code.Placements {
 		for _, relocation := range placement.Section.Relocations {
 			parsed, ok := coffimports.ParseSymbol(relocation.SymbolName)
+			// ProgramPICO keys its IAT by the exact relocation symbol. Preserve
+			// the first encounter so repeated references share one pointer slot.
 			if !ok || bySymbol[relocation.SymbolName] != nil {
 				continue
 			}
@@ -310,7 +317,7 @@ func discoverPICOImports(machine coff.Machine, code *Layout) ([]*picoImport, map
 	return ordered, bySymbol, nil
 }
 
-func applyPICORelocation(machine coff.Machine, sourceRegion picoRegion, code, data *Layout, output []byte, linkedByName map[string]*coff.Section, importsBySymbol map[string]*picoImport, source Placement, relocation *coff.Relocation) (picoPatchup, bool, error) {
+func applyPICORelocation(object *coff.Object, machine coff.Machine, sourceRegion picoRegion, code, data *Layout, output []byte, linkedByName map[string]*coff.Section, importsBySymbol map[string]*picoImport, source Placement, relocation *coff.Relocation) (picoPatchup, bool, error) {
 	stage := "PICO code relocation"
 	if sourceRegion == picoData {
 		stage = "PICO data relocation"
@@ -322,7 +329,7 @@ func applyPICORelocation(machine coff.Machine, sourceRegion picoRegion, code, da
 	if uint64(patchOffset)+4 > uint64(len(output)) {
 		return picoPatchup{}, false, &Error{Stage: stage, Section: source.Section.Name, Relocation: relocation, Err: errors.New("patch site is outside physical region")}
 	}
-	target, err := resolvePICOTarget(code, data, linkedByName, importsBySymbol, relocation)
+	target, err := resolvePICOTarget(object, code, data, linkedByName, importsBySymbol, relocation)
 	if err != nil {
 		return picoPatchup{}, false, &Error{Stage: stage, Section: source.Section.Name, Relocation: relocation, Err: err}
 	}
@@ -394,13 +401,23 @@ func applyPICORelocation(machine coff.Machine, sourceRegion picoRegion, code, da
 	}
 }
 
-func resolvePICOTarget(code, data *Layout, linkedByName map[string]*coff.Section, importsBySymbol map[string]*picoImport, relocation *coff.Relocation) (picoTarget, error) {
+func resolvePICOTarget(object *coff.Object, code, data *Layout, linkedByName map[string]*coff.Section, importsBySymbol map[string]*picoImport, relocation *coff.Relocation) (picoTarget, error) {
 	if relocation.Symbol != nil && relocation.Symbol.Section != nil {
 		if placement, ok := code.Placement(relocation.Symbol.Section); ok {
 			return picoTarget{region: picoCode, placement: placement, symbol: relocation.Symbol}, nil
 		}
 		if placement, ok := data.Placement(relocation.Symbol.Section); ok {
 			return picoTarget{region: picoData, placement: placement, symbol: relocation.Symbol}, nil
+		}
+	}
+	if object != nil {
+		if symbol := object.GetSymbol(relocation.SymbolName); symbol != nil && symbol.Section != nil {
+			if placement, ok := code.Placement(symbol.Section); ok {
+				return picoTarget{region: picoCode, placement: placement, symbol: symbol}, nil
+			}
+			if placement, ok := data.Placement(symbol.Section); ok {
+				return picoTarget{region: picoData, placement: placement, symbol: symbol}, nil
+			}
 		}
 	}
 	if linked := linkedByName[relocation.SymbolName]; linked != nil {
@@ -448,6 +465,10 @@ func buildPICODirectives(object *coff.Object, options PICOOptions, image *PICOIm
 		directives = append(directives, directiveUint32(PICOInstructionPatch, option, patchup.patch))
 	}
 
+	// Upstream uses HashMap for modules, functions, local APIs, and exports, so
+	// its directive byte order is deliberately unspecified. Relocation encounter
+	// order gives the Go port deterministic bytes while emitting the same
+	// semantic loader operations.
 	seenModules := make(map[string]bool)
 	for _, imported := range trackedImports {
 		if imported.module == "" || seenModules[imported.module] {
@@ -487,13 +508,11 @@ func buildPICODirectives(object *coff.Object, options PICOOptions, image *PICOIm
 		if api == "" {
 			return nil, &Error{Stage: "PICO APIs", Err: fmt.Errorf("API entry %d is empty", index)}
 		}
-		if _, exists := apiIndex[api]; exists {
-			return nil, &Error{Stage: "PICO APIs", Err: fmt.Errorf("duplicate API %q", api)}
+		// ExportObject.getAPI() linearly scans the upstream list, so repeated
+		// entries deliberately retain the first index.
+		if _, exists := apiIndex[api]; !exists {
+			apiIndex[api] = index
 		}
-		if index >= math.MaxUint8 {
-			return nil, &Error{Stage: "PICO APIs", Err: errors.New("API table exceeds encodable PATCH_FUNC options")}
-		}
-		apiIndex[api] = index
 	}
 	for _, imported := range trackedImports {
 		if imported.module != "" {
@@ -503,6 +522,9 @@ func buildPICODirectives(object *coff.Object, options PICOOptions, image *PICOIm
 		if !ok {
 			return nil, &Error{Stage: "PICO APIs", Err: fmt.Errorf("function %s is not imported and not in MODULE$Function format", imported.function)}
 		}
+		if index >= math.MaxUint8 {
+			return nil, &Error{Stage: "PICO APIs", Err: fmt.Errorf("API %q at index %d exceeds encodable PATCH_FUNC options", imported.function, index)}
+		}
 		placement, ok := image.DataLayout.Placement(imported.slot)
 		if !ok {
 			return nil, &Error{Stage: "PICO APIs", Err: fmt.Errorf("slot for %q was not laid out", imported.symbol)}
@@ -510,21 +532,11 @@ func buildPICODirectives(object *coff.Object, options PICOOptions, image *PICOIm
 		directives = append(directives, directiveUint32(PICOInstructionPatchFunction, uint8(index+1), placement.Offset))
 	}
 
-	usedTags := make(map[uint32]string, len(options.Exports)+1)
-	usedSymbols := make(map[string]bool, len(options.Exports))
-	for _, exported := range options.Exports {
-		if exported.Symbol == "" {
-			return nil, &Error{Stage: "PICO export", Err: errors.New("export symbol is empty")}
-		}
-		if exported.Tag <= PICOReservedExportMax {
-			return nil, &Error{Stage: "PICO export", Err: fmt.Errorf("tag %#x for %q is reserved", exported.Tag, exported.Symbol)}
-		}
-		if previous := usedTags[exported.Tag]; previous != "" {
-			return nil, &Error{Stage: "PICO export", Err: fmt.Errorf("tag %#x for %q conflicts with %q", exported.Tag, exported.Symbol, previous)}
-		}
-		if usedSymbols[exported.Symbol] {
-			return nil, &Error{Stage: "PICO export", Err: fmt.Errorf("function %q is exported more than once", exported.Symbol)}
-		}
+	exports, err := normalizePICOExports(options.Exports)
+	if err != nil {
+		return nil, err
+	}
+	for _, exported := range exports {
 		symbol := object.GetSymbol(exported.Symbol)
 		if symbol == nil || symbol.Section == nil {
 			return nil, &Error{Stage: "PICO export", Err: fmt.Errorf("symbol %q does not exist", exported.Symbol)}
@@ -541,8 +553,6 @@ func buildPICODirectives(object *coff.Object, options PICOOptions, image *PICOIm
 			return nil, &Error{Stage: "PICO export", Err: fmt.Errorf("function %q: %w", exported.Symbol, err)}
 		}
 		directives = append(directives, directiveUint32(PICOInstructionExport, 0, exported.Tag, offset))
-		usedTags[exported.Tag] = exported.Symbol
-		usedSymbols[exported.Symbol] = true
 	}
 	if unwind != nil {
 		placement, ok := image.CodeLayout.Placement(unwind)
@@ -553,6 +563,37 @@ func buildPICODirectives(object *coff.Object, options PICOOptions, image *PICOIm
 	}
 	directives = append(directives, Directive{Type: PICOInstructionComplete})
 	return directives, nil
+}
+
+// normalizePICOExports models sequential calls to Exports.export. Crystal
+// Palace stores exports in a HashMap: a new tag replaces a prior tag for the
+// same function, while a tag already present in the current map is rejected.
+// Keeping the first slice position gives the Go port stable output without
+// assigning meaning to Java HashMap iteration order.
+func normalizePICOExports(exports []Export) ([]Export, error) {
+	result := make([]Export, 0, len(exports))
+	bySymbol := make(map[string]int, len(exports))
+	byTag := make(map[uint32]string, len(exports))
+	for _, exported := range exports {
+		if exported.Symbol == "" {
+			return nil, &Error{Stage: "PICO export", Err: errors.New("export symbol is empty")}
+		}
+		if exported.Tag <= PICOReservedExportMax {
+			return nil, &Error{Stage: "PICO export", Err: fmt.Errorf("tag %#x for %q is reserved", exported.Tag, exported.Symbol)}
+		}
+		if previous, exists := byTag[exported.Tag]; exists {
+			return nil, &Error{Stage: "PICO export", Err: fmt.Errorf("tag %#x for %q conflicts with %q", exported.Tag, exported.Symbol, previous)}
+		}
+		if index, exists := bySymbol[exported.Symbol]; exists {
+			delete(byTag, result[index].Tag)
+			result[index] = exported
+		} else {
+			bySymbol[exported.Symbol] = len(result)
+			result = append(result, exported)
+		}
+		byTag[exported.Tag] = exported.Symbol
+	}
+	return result, nil
 }
 
 func cloneDirectives(directives []Directive) []Directive {

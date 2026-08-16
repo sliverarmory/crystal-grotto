@@ -89,11 +89,11 @@ go vet ./...
 go build -trimpath -o crystal-grotto ./cmd/crystal-grotto
 ```
 
-The full BTF race suite is deliberately exhaustive and can take several
-minutes under instrumentation; the full mutation suite has similar decoder
-startup costs. CI runs every ordinary test, race-tests the remaining packages
-with bounded package parallelism, and runs the dedicated mutation and
-shared-object easy-PIC concurrency tests under the race detector.
+The full transformation race suites are deliberately exhaustive and can take
+several minutes because portable decoder instances have substantial
+WebAssembly startup costs. CI runs every ordinary test, race-tests core
+packages as a group, and runs each decoder-heavy transformation's dedicated
+concurrency test in an independent matrix job.
 
 The normal suite is hermetic: it does not download, compile, or execute Crystal Palace. Test modules maintained in this repository are original Crystal Grotto fixtures; upstream Java and demo source remain outside the repository.
 
@@ -117,10 +117,11 @@ The helper refuses to overwrite an existing `cpsrc/` directory. Use a new tempor
 
 ## Continuous integration
 
-GitHub Actions runs on every pull request targeting `main` and every push to `main` (including merges). The workflow has two layers:
+GitHub Actions runs on every pull request targeting `main` and every push to `main` (including merges). The workflow has three layers:
 
-1. formatting, module verification, `go vet`, the complete unit/end-to-end suite, broad race coverage plus focused mutation/easy-PIC concurrency races, and a CLI build; and
-2. a Linux compatibility job with Java, Ant, and MinGW-w64 that builds the checksum-pinned Crystal Palace reference in runner-temporary storage and runs the `compat` test suite.
+1. formatting, module verification, `go vet`, the complete unit/end-to-end suite, and a CLI build;
+2. core and focused transformation race-detector jobs; and
+3. a Linux compatibility job with Java, Ant, and MinGW-w64 that builds the checksum-pinned Crystal Palace reference in runner-temporary storage and runs the `compat` test suite.
 
 No upstream source or generated JAR is uploaded or committed by the workflow.
 

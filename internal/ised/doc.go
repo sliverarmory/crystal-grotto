@@ -12,21 +12,33 @@
 // and +split semantics. Candidate commands are shuffled with injectable
 // randomness before one eligible edit is selected for each instruction phase.
 //
-// # Decoder and encoder boundary
+// # Object lift and rewrite
 //
 // Crystal Palace gets canonical opcode forms, flag producer/consumer zones,
 // prologue/epilogue bookends, and relocation-aware instruction encoding from
-// Iced. The current Capstone adapter in internal/x86 does not expose equivalent
-// typed detail. BuildPlan therefore requires callers to supply those semantics
-// explicitly and returns ErrSemanticDetailUnavailable when a canonical Form or
-// assembly rendering is missing; formatted Capstone operands are never guessed
-// into an Iced form.
+// Iced. LiftObject combines Capstone's authoritative instruction boundaries
+// with a conservative raw-byte semantic decoder for common x86/x64 forms. It
+// exposes exact form/mnemonic keys whenever those are proven, exact MASM keys
+// only for the small register/implied-operand subset whose spelling is proven,
+// and marks everything else incomplete. BuildPlan permits unrelated commands
+// to pass such instructions but returns ErrSemanticDetailUnavailable whenever
+// a requested key could depend on missing Iced detail. Formatted Capstone
+// operands are never converted into semantic operands or targets.
 //
-// Apply is transactional and delegates arbitrary length-changing object edits
-// to RewriteBackend. FixedBackend is built in for the provable subset whose
-// selected bytes occupy exactly the original instruction span. It deliberately
-// returns ErrReencoderUnavailable instead of shifting code without repairing
-// branches, symbols, unwind ranges, and relocations.
+// ApplyObject is the engine-facing transactional operation. RebaseBackend
+// supports raw insert, replace, and split output while rebasing proven relative
+// branches/RIP references, symbols, relocations, section-symbol addends,
+// function auxiliary sizes, and relocation-backed pdata ranges. Ordinary jump
+// targets follow upstream's post-prepend label placement while named local
+// labels retain the pre-prepend function/data address. Existing pdata requires
+// unwind-aware planning, whose byte-derived bookend walk follows upstream.
+// Unknown PC-relative forms, unrelocated unwind ranges, unsupported relocation
+// widths, and branches that would require form relaxation fail with typed
+// errors; injected bytes are intentionally opaque raw content, as upstream's
+// program.db calls are.
+//
+// Apply and FixedBackend remain available for callers that already own a
+// semantic Program or require same-size replacement only.
 //
 // In the upstream export pipeline ised runs after intrinsic/hook rewriting,
 // easy-PIC/DFR resolution, ordering/rule analysis, and +mutate; it runs before

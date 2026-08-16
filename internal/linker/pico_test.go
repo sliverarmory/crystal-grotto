@@ -347,7 +347,7 @@ func TestEmitPICOExportValidation(t *testing.T) {
 	}{
 		{name: "reserved", exports: []Export{{Symbol: "one", Tag: 7}}, want: "reserved"},
 		{name: "collision", exports: []Export{{Symbol: "one", Tag: 9}, {Symbol: "two", Tag: 9}}, want: "conflicts"},
-		{name: "duplicate function", exports: []Export{{Symbol: "one", Tag: 9}, {Symbol: "one", Tag: 10}}, want: "more than once"},
+		{name: "duplicate function and tag", exports: []Export{{Symbol: "one", Tag: 9}, {Symbol: "one", Tag: 9}}, want: "conflicts"},
 		{name: "missing", exports: []Export{{Symbol: "missing", Tag: 9}}, want: "does not exist"},
 		{name: "not function", exports: []Export{{Symbol: "notfunc", Tag: 9}}, want: "not a function"},
 	}

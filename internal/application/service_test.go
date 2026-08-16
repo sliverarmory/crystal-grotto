@@ -49,6 +49,28 @@ func TestServiceCollectsProgramMessages(t *testing.T) {
 	}
 }
 
+func TestServiceConfigHooksPersistIntoProgram(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	config := filepath.Join(dir, "hooks.spec")
+	program := filepath.Join(dir, "program.spec")
+	writeTestFile(t, config, "x64:\n  before \"push\": echo \"before\" %_\n  after \"push\": echo \"after\" %_\n")
+	writeTestFile(t, program, "x64:\n  push $NULL\n")
+
+	result, err := (Service{}).Build(context.Background(), server.BuildRequest{
+		Spec:   program,
+		Arch:   "x64",
+		Config: []string{config},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "[*] before push $NULL in program.spec (x64)\n[*] after push $NULL in program.spec (x64)"
+	if result.Message != want {
+		t.Fatalf("message = %q, want %q", result.Message, want)
+	}
+}
+
 func TestServiceReportsSpecContext(t *testing.T) {
 	t.Parallel()
 	_, err := (Service{}).Build(context.Background(), server.BuildRequest{Spec: filepath.Join(t.TempDir(), "missing.spec"), Arch: "x64"})

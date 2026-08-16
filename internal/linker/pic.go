@@ -51,20 +51,19 @@ func EmitPIC(object *coff.Object, options PICOptions) (*PICImage, error) {
 		return nil, &Error{Stage: "PIC", Err: errors.New("object has no .text section")}
 	}
 	entries := []layoutEntry{{section: text}}
-	if object.Machine == coff.MachineAMD64 {
-		if section := object.GetSection(".rdata"); section != nil {
-			// ProgramPIC64 rejects every relocation in .rdata. ADDR64 needs a
-			// runtime base; the remaining forms usually indicate a jump table.
-			if len(section.Relocations) != 0 {
-				relocation := section.Relocations[0]
-				detail := "suspected jump table; compile with -fno-jump-tables or equivalent"
-				if relocation != nil && relocation.Type == coff.RelAMD64Addr64 {
-					detail = "ADDR64 in .rdata cannot be resolved from raw PIC"
-				}
-				return nil, &Error{Stage: "PIC .rdata", Section: section.Name, Relocation: relocation, Err: errors.New(detail)}
+	if section := object.GetSection(".rdata"); section != nil {
+		// ProgramPIC64 is upstream's raw-PIC exporter for both x86 and x64.
+		// It appends relocation-free .rdata in either architecture and rejects
+		// all .rdata relocations because no runtime image base is available.
+		if len(section.Relocations) != 0 {
+			relocation := section.Relocations[0]
+			detail := "suspected jump table; compile with -fno-jump-tables or equivalent"
+			if object.Machine == coff.MachineAMD64 && relocation != nil && relocation.Type == coff.RelAMD64Addr64 {
+				detail = "ADDR64 in .rdata cannot be resolved from raw PIC"
 			}
-			entries = append(entries, layoutEntry{section: section})
+			return nil, &Error{Stage: "PIC .rdata", Section: section.Name, Relocation: relocation, Err: errors.New(detail)}
 		}
+		entries = append(entries, layoutEntry{section: section})
 	}
 	if options.IncludeData {
 		if section := object.GetSection(".data"); section != nil {
@@ -120,7 +119,7 @@ func EmitPIC(object *coff.Object, options PICOptions) (*PICImage, error) {
 			if relocation == nil {
 				return nil, &Error{Stage: "PIC relocation", Section: placement.Section.Name, Err: errors.New("nil relocation")}
 			}
-			if err := applyPICRelocation(object.Machine, layout, image.Bytes, linkedByName, placement, relocation, options); err != nil {
+			if err := applyPICRelocation(object, object.Machine, layout, image.Bytes, linkedByName, placement, relocation, options); err != nil {
 				return nil, err
 			}
 		}
@@ -128,7 +127,7 @@ func EmitPIC(object *coff.Object, options PICOptions) (*PICImage, error) {
 	return image, nil
 }
 
-func applyPICRelocation(machine coff.Machine, layout *Layout, output []byte, linkedByName map[string]*coff.Section, source Placement, relocation *coff.Relocation, options PICOptions) error {
+func applyPICRelocation(object *coff.Object, machine coff.Machine, layout *Layout, output []byte, linkedByName map[string]*coff.Section, source Placement, relocation *coff.Relocation, options PICOptions) error {
 	patchOffset, err := checkedAdd32(source.Offset, relocation.VirtualAddress)
 	if err != nil {
 		return &Error{Stage: "PIC relocation", Section: source.Section.Name, Relocation: relocation, Err: err}
@@ -136,7 +135,7 @@ func applyPICRelocation(machine coff.Machine, layout *Layout, output []byte, lin
 	if uint64(patchOffset)+4 > uint64(len(output)) {
 		return &Error{Stage: "PIC relocation", Section: source.Section.Name, Relocation: relocation, Err: errors.New("patch site is outside output")}
 	}
-	targetSection, targetSymbol, err := relocationTarget(layout, linkedByName, relocation)
+	targetSection, targetSymbol, err := relocationTarget(object, layout, linkedByName, relocation)
 	if err != nil {
 		return &Error{Stage: "PIC relocation", Section: source.Section.Name, Relocation: relocation, Err: err}
 	}
@@ -181,10 +180,17 @@ func applyPICRelocation(machine coff.Machine, layout *Layout, output []byte, lin
 	return nil
 }
 
-func relocationTarget(layout *Layout, linkedByName map[string]*coff.Section, relocation *coff.Relocation) (*coff.Section, *coff.Symbol, error) {
+func relocationTarget(object *coff.Object, layout *Layout, linkedByName map[string]*coff.Section, relocation *coff.Relocation) (*coff.Section, *coff.Symbol, error) {
 	if relocation.Symbol != nil && relocation.Symbol.Section != nil {
 		if _, ok := layout.Placement(relocation.Symbol.Section); ok {
 			return relocation.Symbol.Section, relocation.Symbol, nil
+		}
+	}
+	if object != nil {
+		if symbol := object.GetSymbol(relocation.SymbolName); symbol != nil && symbol.Section != nil {
+			if _, ok := layout.Placement(symbol.Section); ok {
+				return symbol.Section, symbol, nil
+			}
 		}
 	}
 	if linked := linkedByName[relocation.SymbolName]; linked != nil {

@@ -55,20 +55,106 @@ jobs:
       - name: Run unit and deterministic E2E tests
         run: go test -count=1 ./...
 
-      - name: Run race tests
-        shell: bash
-        run: |
-          mapfile -t packages < <(go list ./... | grep -Ev '/internal/(btf|mutate)$')
-          go test -race -p=2 -count=1 "${packages[@]}"
-
-      - name: Race-test mutation on independent objects
-        run: go test -race -count=1 -run '^TestApplyConcurrentIndependentObjects$' ./internal/mutate
-
-      - name: Race-test easy-PIC shared-object mutation
-        run: go test -race -count=1 -run '^TestFixConcurrentCallsOnOneObject$' ./internal/btf
-
       - name: Build command
         run: go build -trimpath -o "${RUNNER_TEMP}/crystal-grotto" ./cmd/crystal-grotto
+
+  race-core:
+    name: Race detector (core packages)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run core race tests
+        shell: bash
+        run: |
+          mapfile -t packages < <(go list ./... | grep -Ev '/internal/(blockparty|btf|engine|hookencode|hookresolve|hooks|intrinsicexpand|ised|mutate|regdance|resolver|rulegen|safety|shatter|transfer|unwindgen|x86)$')
+          go test -race -p=2 -count=1 "${packages[@]}"
+
+  race-transforms:
+    name: Race detector (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86 decoder
+            package: ./internal/x86
+            test: '^TestCapstoneConcurrentUse$'
+          - name: easy PIC
+            package: ./internal/btf
+            test: '^TestFixConcurrentCallsOnOneObject$'
+          - name: mutation
+            package: ./internal/mutate
+            test: '^TestApplyConcurrentIndependentObjects$'
+          - name: register dance
+            package: ./internal/regdance
+            test: '^TestApplyConcurrentCalls$'
+          - name: hook encoder
+            package: ./internal/hookencode
+            test: '^TestConcurrentApplyDeterministic$'
+          - name: hook resolver intrinsic
+            package: ./internal/hookresolve
+            test: '^TestApplyConcurrentDeterminism$'
+          - name: user intrinsic expansion
+            package: ./internal/intrinsicexpand
+            test: '^TestApplyConcurrentDeterminism$'
+          - name: hook model
+            package: ./internal/hooks
+            test: '^TestConcurrentQueriesAndTransactionalApply$'
+          - name: resolver
+            package: ./internal/resolver
+            test: '^(TestApplyBuiltinIsConcurrentAndDeterministic|TestConfigurationAndPlanningAreConcurrentReadSafe)$'
+          - name: rule generation
+            package: ./internal/rulegen
+            test: '^TestGenerateConcurrentDeterminism$'
+          - name: safety graph
+            package: ./internal/safety
+            test: '^TestGraphConcurrentChecks$'
+          - name: ISED planning
+            package: ./internal/ised
+            test: '^(TestConfigurationAndPlanningAreConcurrentReadSafe|TestApplyObjectConcurrentReadSafe)$'
+          - name: block party
+            package: ./internal/blockparty
+            test: '^TestFactoryLifecycleCancellationAndConcurrentUse$'
+          - name: shatter
+            package: ./internal/shatter
+            test: '^TestApplyConcurrentIndependentObjects$'
+          - name: transfer intrinsic
+            package: ./internal/transfer
+            test: '^TestLifecycleCancellationValidationAndConcurrency$'
+          - name: unwind generation
+            package: ./internal/unwindgen
+            test: '^TestCancellationFactoryLifecycleAndConcurrentUse$'
+          - name: engine
+            package: ./internal/engine
+            test: '^TestHandlerCanServeIndependentExecutionsConcurrently$'
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.5'
+          cache: true
+
+      - name: Run focused race test
+        run: go test -race -count=1 -run "${{ matrix.test }}" "${{ matrix.package }}"
 
   compatibility:
     name: Crystal Palace compatibility

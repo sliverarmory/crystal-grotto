@@ -63,6 +63,7 @@ type Configuration struct {
 	Strip         []string
 	Patches       []Patch
 	Links         []linker.LinkedSection
+	LinkPosts     []string
 	APIs          []string
 	Exports       []linker.Export
 	Magic         []uint32
@@ -97,6 +98,8 @@ type artifactConfig struct {
 	patchIndex    map[string]int
 	links         []linker.LinkedSection
 	linkIndex     map[string]int
+	linkPosts     []string
+	linkPostIndex map[string]int
 	apis          []string
 	exports       []linker.Export
 	exportIndex   map[string]int
@@ -123,16 +126,17 @@ func newArtifact(kind Kind, object *coff.Object) *Artifact {
 		kind:   kind,
 		object: object,
 		config: artifactConfig{
-			entry:       entry,
-			options:     make(map[string]struct{}),
-			strip:       make(map[string]struct{}),
-			patchIndex:  make(map[string]int),
-			linkIndex:   make(map[string]int),
-			exportIndex: make(map[string]int),
-			apis:        []string{"LoadLibraryA", "GetProcAddress"},
-			hooks:       hooks,
-			ised:        ised.EmptyConfiguration(),
-			resolvers:   resolver.EmptyConfiguration(),
+			entry:         entry,
+			options:       make(map[string]struct{}),
+			strip:         make(map[string]struct{}),
+			patchIndex:    make(map[string]int),
+			linkIndex:     make(map[string]int),
+			linkPostIndex: make(map[string]int),
+			exportIndex:   make(map[string]int),
+			apis:          []string{"LoadLibraryA", "GetProcAddress"},
+			hooks:         hooks,
+			ised:          ised.EmptyConfiguration(),
+			resolvers:     resolver.EmptyConfiguration(),
 		},
 	}
 }
@@ -174,6 +178,7 @@ func (a *Artifact) Configuration() Configuration {
 		Strip:         sortedKeys(a.config.strip),
 		Patches:       clonePatches(a.config.patches),
 		Links:         cloneLinks(a.config.links),
+		LinkPosts:     append([]string(nil), a.config.linkPosts...),
 		APIs:          append([]string(nil), a.config.apis...),
 		Exports:       append([]linker.Export(nil), a.config.exports...),
 		Magic:         append([]uint32(nil), a.config.magic...),
@@ -216,6 +221,7 @@ func (a *Artifact) setPatch(symbol string, data []byte) {
 
 func (a *Artifact) setLink(link linker.LinkedSection) {
 	link.Data = append([]byte(nil), link.Data...)
+	link.Relocations = append([]linker.LinkedRelocation(nil), link.Relocations...)
 	if index, ok := a.config.linkIndex[link.Name]; ok {
 		a.config.links[index] = link
 		return
@@ -224,9 +230,18 @@ func (a *Artifact) setLink(link linker.LinkedSection) {
 	a.config.links = append(a.config.links, link)
 }
 
+func (a *Artifact) setLinkPost(name string) {
+	if index, ok := a.config.linkPostIndex[name]; ok {
+		a.config.linkPosts[index] = name
+		return
+	}
+	a.config.linkPostIndex[name] = len(a.config.linkPosts)
+	a.config.linkPosts = append(a.config.linkPosts, name)
+}
+
 func (a *Artifact) setExport(export linker.Export) error {
 	for _, existing := range a.config.exports {
-		if existing.Tag == export.Tag && existing.Symbol != export.Symbol {
+		if existing.Tag == export.Tag {
 			return fmt.Errorf("export tag %#08x for %s conflicts with %s", export.Tag, export.Symbol, existing.Symbol)
 		}
 	}
@@ -279,9 +294,6 @@ func (a *Artifact) unsupportedError() error {
 			features[command.Name] = struct{}{}
 		}
 	}
-	if !a.config.ised.IsEmpty() {
-		features["ised"] = struct{}{}
-	}
 	if len(features) == 0 {
 		return nil
 	}
@@ -289,11 +301,15 @@ func (a *Artifact) unsupportedError() error {
 }
 
 var supportedTransformOptions = map[string]struct{}{
-	"+disco":    {},
-	"+gofirst":  {},
-	"+mutate":   {},
-	"+optimize": {},
-	"+relax":    {},
+	"+blockparty": {},
+	"+disco":      {},
+	"+gofirst":    {},
+	"+mutate":     {},
+	"+optimize":   {},
+	"+regdance":   {},
+	"+relax":      {},
+	"+shatter":    {},
+	"+unwind":     {},
 }
 
 func sortedKeys(values map[string]struct{}) []string {
@@ -318,6 +334,7 @@ func cloneLinks(values []linker.LinkedSection) []linker.LinkedSection {
 	for index, value := range values {
 		result[index] = value
 		result[index].Data = append([]byte(nil), value.Data...)
+		result[index].Relocations = append([]linker.LinkedRelocation(nil), value.Relocations...)
 	}
 	return result
 }

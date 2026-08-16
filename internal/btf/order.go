@@ -8,6 +8,7 @@
 package btf
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
 	"fmt"
@@ -16,11 +17,19 @@ import (
 	"strings"
 
 	"github.com/sliverarmory/crystal-grotto/internal/coff"
+	"github.com/sliverarmory/crystal-grotto/internal/x86"
 )
 
-// OrderOptions controls the symbol-and-relocation-safe function ordering
-// passes that do not require instruction re-encoding.
+// OrderOptions controls symbol-, relocation-, and control-flow-safe function
+// ordering. Relocation-free local branches are decoded and re-encoded when
+// their source or target moves.
 type OrderOptions struct {
+	// Context controls decoding. A nil context is treated as Background.
+	Context context.Context
+	// Disassembler overrides the default portable Capstone decoder. The caller
+	// retains ownership and ApplyOrderPasses never closes it.
+	Disassembler x86.Disassembler
+
 	Entry         string
 	Exports       []string
 	CatchHandlers []string
@@ -80,6 +89,9 @@ func ApplyOrderPasses(object *coff.Object, options OrderOptions) (OrderReport, e
 	if text == nil {
 		return OrderReport{}, errors.New("btf: object has no .text section")
 	}
+	if !object.IsIntel() {
+		return OrderReport{}, fmt.Errorf("btf: ordering is unsupported for %s", object.Machine)
+	}
 	chunks, err := splitCode(object, text)
 	if err != nil {
 		return OrderReport{}, err
@@ -93,6 +105,11 @@ func ApplyOrderPasses(object *coff.Object, options OrderOptions) (OrderReport, e
 			entry = "go"
 		}
 	}
+	analysis, err := analyzeOrder(object, text, chunks, options)
+	if err != nil {
+		return OrderReport{}, err
+	}
+	removeSymbols := make(map[string]struct{})
 
 	if options.GoFirst {
 		index := chunkForFunction(chunks, entry)
@@ -103,8 +120,11 @@ func ApplyOrderPasses(object *coff.Object, options OrderOptions) (OrderReport, e
 	}
 	if options.Optimize {
 		var removed []string
-		chunks, removed, err = optimizeChunks(object, text, chunks, entry, options.Exports, options.CatchHandlers)
+		chunks, removed, removeSymbols, err = optimizeChunks(text, chunks, analysis, entry, options.Exports, options.CatchHandlers)
 		if err != nil {
+			return OrderReport{}, err
+		}
+		if err := trimOptimizedPadding(object, text, chunks, analysis); err != nil {
 			return OrderReport{}, err
 		}
 		report.Removed = removed
@@ -118,7 +138,7 @@ func ApplyOrderPasses(object *coff.Object, options OrderOptions) (OrderReport, e
 			return OrderReport{}, err
 		}
 	}
-	if err := rebuildText(object, text, chunks); err != nil {
+	if err := rebuildText(object, text, chunks, analysis, removeSymbols); err != nil {
 		return OrderReport{}, err
 	}
 	report.FinalOrder = chunkNames(chunks)
@@ -173,7 +193,7 @@ func splitCode(object *coff.Object, text *coff.Section) ([]*codeChunk, error) {
 	return chunks, nil
 }
 
-func optimizeChunks(object *coff.Object, text *coff.Section, chunks []*codeChunk, entry string, exports, handlers []string) ([]*codeChunk, []string, error) {
+func optimizeChunks(text *coff.Section, chunks []*codeChunk, analysis *orderAnalysis, entry string, exports, handlers []string) ([]*codeChunk, []string, map[string]struct{}, error) {
 	byFunction := make(map[string]*codeChunk)
 	for _, chunk := range chunks {
 		for _, name := range chunk.functionNames() {
@@ -189,39 +209,40 @@ func optimizeChunks(object *coff.Object, text *coff.Section, chunks []*codeChunk
 			return
 		}
 		reachable[chunk] = true
+		for target := range analysis.edges[chunk] {
+			visit(target)
+		}
 		for _, relocation := range chunk.relocs {
-			if relocation.Symbol != nil && relocation.Symbol.Section == text && relocation.Symbol.IsFunction() {
-				visit(byFunction[relocation.Symbol.Name])
-				continue
-			}
 			if strings.HasPrefix(relocation.SymbolName, ".refptr.") {
 				visit(byFunction[strings.TrimPrefix(relocation.SymbolName, ".refptr.")])
 				continue
 			}
-			if relocation.SymbolName == ".text" {
-				offset, err := relocation.Offset()
-				if err != nil || offset < 0 {
-					continue
-				}
-				for name, candidate := range byFunction {
-					symbol := object.GetSymbol(name)
-					if symbol != nil && symbol.Value == uint32(offset) {
-						visit(candidate)
-						break
-					}
-				}
+			if target := relocationTargetChunk(text, chunks, relocation); target != nil {
+				visit(target)
 			}
 		}
 	}
+	roots := 0
 	for _, seed := range seeds {
-		visit(byFunction[seed])
+		if root := byFunction[seed]; root != nil {
+			roots++
+			visit(root)
+		}
 	}
-	if len(reachable) == 0 {
-		return nil, nil, fmt.Errorf("+optimize requires %s function as entrypoint or 1+ exported functions", entry)
+	if roots == 0 {
+		return nil, nil, nil, fmt.Errorf("+optimize requires %s function as entrypoint or 1+ exported functions", entry)
+	}
+	// Non-function regions are not removed by upstream. Walk them as roots so
+	// their relocation-backed references cannot dangle after optimization.
+	for _, chunk := range chunks {
+		if !chunk.isFunction() {
+			visit(chunk)
+		}
 	}
 
 	kept := make([]*codeChunk, 0, len(chunks))
 	removeNames := make(map[string]struct{})
+	removeSymbols := make(map[string]struct{})
 	var removed []string
 	for _, chunk := range chunks {
 		if !chunk.isFunction() || reachable[chunk] {
@@ -229,6 +250,9 @@ func optimizeChunks(object *coff.Object, text *coff.Section, chunks []*codeChunk
 			continue
 		}
 		for _, symbol := range chunk.symbols {
+			if !symbol.IsSectionName() {
+				removeSymbols[symbol.Name] = struct{}{}
+			}
 			if symbol.IsFunction() {
 				removeNames[symbol.Name] = struct{}{}
 				removed = append(removed, symbol.Name)
@@ -236,18 +260,30 @@ func optimizeChunks(object *coff.Object, text *coff.Section, chunks []*codeChunk
 		}
 	}
 	for _, chunk := range kept {
+		for target := range analysis.edges[chunk] {
+			if !reachable[target] && target.isFunction() {
+				return nil, nil, nil, fmt.Errorf("btf: kept code still references optimized function %s", target.displayName())
+			}
+		}
 		for _, relocation := range chunk.relocs {
 			if _, removedTarget := removeNames[relocation.SymbolName]; removedTarget {
-				return nil, nil, fmt.Errorf("btf: kept code still references optimized function %s", relocation.SymbolName)
+				return nil, nil, nil, fmt.Errorf("btf: kept code still references optimized function %s", relocation.SymbolName)
 			}
 		}
 	}
-	object.RemoveSymbols(removeNames)
-	return kept, removed, nil
+	return kept, removed, removeSymbols, nil
 }
 
 func shuffleChunks(chunks []*codeChunk, preserveFirst bool, random io.Reader) error {
-	if len(chunks) <= 1 {
+	functionCount := 0
+	for _, chunk := range chunks {
+		if chunk.isFunction() {
+			functionCount++
+		}
+	}
+	// FunctionDisco is an upstream no-op unless at least two functions exist;
+	// inline data labels do not make a one-function program eligible.
+	if functionCount <= 1 {
 		return nil
 	}
 	start := 0
@@ -279,34 +315,90 @@ func shuffleChunks(chunks []*codeChunk, preserveFirst bool, random io.Reader) er
 	return nil
 }
 
-func rebuildText(object *coff.Object, text *coff.Section, chunks []*codeChunk) error {
+func rebuildText(object *coff.Object, text *coff.Section, chunks []*codeChunk, analysis *orderAnalysis, removeSymbols map[string]struct{}) error {
+	placements := make(map[*codeChunk]uint32, len(chunks))
+	auxiliary, err := optimizedFunctionAuxiliary(chunks)
+	if err != nil {
+		return err
+	}
 	newData := make([]byte, 0, len(text.Data))
 	newRelocations := make([]*coff.Relocation, 0, len(text.Relocations))
 	for _, chunk := range chunks {
 		newStart := uint32(len(newData))
+		retainedEnd := chunk.start + uint32(len(chunk.data))
+		placements[chunk] = newStart
 		newData = append(newData, chunk.data...)
 		for _, symbol := range chunk.symbols {
-			if symbol.Value < chunk.start || symbol.Value >= chunk.end {
+			if symbol.IsSectionName() {
+				continue
+			}
+			if symbol.Value < chunk.start || symbol.Value >= retainedEnd {
 				return fmt.Errorf("btf: symbol %s escaped its code chunk", symbol.Name)
 			}
-			symbol.Value = newStart + (symbol.Value - chunk.start)
 		}
 		for _, relocation := range chunk.relocs {
 			if relocation.VirtualAddress < chunk.start || relocation.VirtualAddress >= chunk.end {
 				return fmt.Errorf("btf: relocation %#x escaped its code chunk", relocation.VirtualAddress)
 			}
-			relocation.VirtualAddress = newStart + (relocation.VirtualAddress - chunk.start)
-			relocation.Section = text
+			if relocation.VirtualAddress >= retainedEnd {
+				continue
+			}
+			if uint64(relocation.VirtualAddress)+4 > uint64(retainedEnd) {
+				return fmt.Errorf("btf: relocation %#x straddles optimized padding in %s", relocation.VirtualAddress, chunk.displayName())
+			}
 			newRelocations = append(newRelocations, relocation)
 		}
 	}
+	if err := repairOrderReferences(newData, placements, analysis); err != nil {
+		return err
+	}
+	// All fallible work is complete. Commit symbol/relocation rebases and the
+	// rebuilt section as one transaction.
+	for _, chunk := range chunks {
+		newStart := placements[chunk]
+		for _, symbol := range chunk.symbols {
+			if symbol.IsSectionName() {
+				continue
+			}
+			symbol.Value = newStart + (symbol.Value - chunk.start)
+		}
+		for _, relocation := range chunk.relocs {
+			if relocation.VirtualAddress >= chunk.start+uint32(len(chunk.data)) {
+				continue
+			}
+			relocation.VirtualAddress = newStart + (relocation.VirtualAddress - chunk.start)
+			relocation.Section = text
+		}
+	}
+	for symbol, records := range auxiliary {
+		symbol.AuxiliaryRecords = records
+	}
 	sort.SliceStable(newRelocations, func(i, j int) bool { return newRelocations[i].VirtualAddress < newRelocations[j].VirtualAddress })
+	if len(removeSymbols) != 0 {
+		object.RemoveSymbols(removeSymbols)
+	}
 	text.Data = newData
 	text.SizeOfRawData = uint32(len(newData))
 	if text.VirtualSize != 0 {
 		text.VirtualSize = uint32(len(newData))
 	}
 	text.Relocations = newRelocations
+	return nil
+}
+
+func relocationTargetChunk(text *coff.Section, chunks []*codeChunk, relocation *coff.Relocation) *codeChunk {
+	if relocation == nil {
+		return nil
+	}
+	if relocation.Symbol != nil && relocation.Symbol.Section == text {
+		target := int64(relocation.Symbol.Value)
+		if offset, err := relocation.Offset(); err == nil {
+			target += int64(offset)
+		}
+		if target >= 0 && target < int64(len(text.Data)) {
+			return chunkAtOffset(chunks, uint32(target))
+		}
+	}
 	return nil
 }
 

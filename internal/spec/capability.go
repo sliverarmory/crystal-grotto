@@ -8,11 +8,14 @@ package spec
 import (
 	"encoding/binary"
 	"fmt"
+
+	"github.com/sliverarmory/crystal-grotto/internal/coff"
 )
 
 const (
-	machineX86 = 0x014c
-	machineX64 = 0x8664
+	machineX86   = 0x014c
+	machineX64   = 0x8664
+	machineARM64 = 0xaa64
 )
 
 // Capability describes the input program made available to a spec.
@@ -39,7 +42,7 @@ func None(archOrLabel string) (Capability, error) {
 	return Capability{Contents: []byte{}, Label: archOrLabel, Arch: arch}, nil
 }
 
-// ParseCapability detects and minimally validates a Windows DLL or COFF object.
+// ParseCapability detects and validates a Windows DLL or COFF object.
 func ParseCapability(data []byte) (Capability, error) {
 	if len(data) < 2 {
 		return Capability{}, fmt.Errorf("Argument is not a COFF or DLL.")
@@ -55,12 +58,15 @@ func ParseCapability(data []byte) (Capability, error) {
 	}
 }
 
-// ParseObject constructs a capability from a COFF object header.
+// ParseObject constructs a capability from a fully validated COFF object.
+// Crystal Palace rejects malformed section, symbol, string, and relocation
+// tables when it creates an object capability, before a specification runs.
 func ParseObject(data []byte) (Capability, error) {
-	if len(data) < 20 {
-		return Capability{}, fmt.Errorf("Invalid Object: COFF header is truncated")
+	object, err := coff.Parse(data)
+	if err != nil {
+		return Capability{}, fmt.Errorf("Invalid Object: %w", err)
 	}
-	arch, err := machineArch(binary.LittleEndian.Uint16(data[:2]))
+	arch, err := machineArch(uint16(object.Machine))
 	if err != nil {
 		return Capability{}, fmt.Errorf("Invalid Object: %w", err)
 	}
@@ -112,6 +118,8 @@ func machineArch(machine uint16) (string, error) {
 		return "x86", nil
 	case machineX64:
 		return "x64", nil
+	case machineARM64:
+		return "arm64", nil
 	default:
 		return "", fmt.Errorf("unknown machine 0x%04x", machine)
 	}

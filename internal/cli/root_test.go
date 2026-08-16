@@ -90,6 +90,13 @@ func TestCOFFParseAndDisassembleCommands(t *testing.T) {
 			t.Errorf("coffparse output %q does not contain %q", parseOutput.String(), want)
 		}
 	}
+	var extraOutput bytes.Buffer
+	if err := Execute(context.Background(), []string{"coffparse", objectPath, "ignored"}, Streams{Out: &extraOutput}); err != nil {
+		t.Fatalf("coffparse with ignored extra argument: %v", err)
+	}
+	if extraOutput.String() != parseOutput.String() {
+		t.Fatalf("coffparse extra argument changed output\nplain: %q\nextra: %q", parseOutput.String(), extraOutput.String())
+	}
 
 	var disassembly, disassemblyErrors bytes.Buffer
 	if err := Execute(context.Background(), []string{"disassemble", objectPath}, Streams{Out: &disassembly, Err: &disassemblyErrors}); err != nil {

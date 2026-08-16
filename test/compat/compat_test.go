@@ -91,9 +91,11 @@ func TestMinGWCOFFCompatibility(t *testing.T) {
 		want     []byte
 	}{
 		{name: "x86", compiler: "i686-w64-mingw32-gcc", source: "basic.x86.S", spec: "pic.spec", want: []byte{0xb8, 0x2a, 0, 0, 0, 0xc3, 0x90, 0x90}},
+		{name: "x86_rdata", compiler: "i686-w64-mingw32-gcc", source: "rdata.x86.S", spec: "pic.spec"},
 		{name: "x64", compiler: "x86_64-w64-mingw32-gcc", source: "basic.x64.S", spec: "pic.spec", want: []byte{0xb8, 0x2a, 0, 0, 0, 0xc3, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90}},
 		{name: "x64_relax", compiler: "x86_64-w64-mingw32-gcc", source: "relax.x64.S", spec: "relax.spec"},
 		{name: "x64_fixbss", compiler: "x86_64-w64-mingw32-gcc", source: "fixbss.x64.S", spec: "fixbss.spec"},
+		{name: "x64_unwind_linkpost", compiler: "x86_64-w64-mingw32-gcc", source: "unwind.x64.S", spec: "unwind.spec"},
 	} {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
@@ -223,8 +225,201 @@ func TestDFRSemanticCompatibility(t *testing.T) {
 		t.Fatalf("DFR process output differs\nGrotto stdout: %q\nPalace stdout: %q\nGrotto stderr: %q\nPalace stderr: %q",
 			grottoStdout, palaceStdout, grottoStderr, palaceStderr)
 	}
+	executePICOutputs(t, workDir, []picExecution{
+		{name: "Crystal Grotto DFR", path: grottoOutput},
+		{name: "Crystal Palace DFR", path: palaceOutput},
+	})
+}
+
+func TestHookResolverSemanticCompatibility(t *testing.T) {
+	palaceJAR := requireArtifact(t, palaceJAREnv, false)
+	grottoBin := requireArtifact(t, grottoBinEnv, true)
+	java, err := exec.LookPath("java")
+	if err != nil {
+		t.Fatalf("compat build tag requires java in PATH: %v", err)
+	}
+	compiler, err := exec.LookPath("x86_64-w64-mingw32-gcc")
+	if err != nil {
+		t.Fatalf("compat build tag requires x86_64-w64-mingw32-gcc in PATH: %v", err)
+	}
+	root := repositoryRoot(t)
+	fixtures := filepath.Join(root, "testdata", "modules", "coff")
+	workDir := t.TempDir()
+	objectPath := filepath.Join(workDir, "hookresolve.x64.o")
+	compile := exec.Command(compiler, "-c", "-o", objectPath, filepath.Join(fixtures, "hookresolve.x64.S"))
+	compile.Dir = workDir
+	if output, err := compile.CombinedOutput(); err != nil {
+		t.Fatalf("compile hook-resolver COFF fixture: %v\n%s", err, output)
+	}
+
+	specPath := filepath.Join(fixtures, "hookresolve.spec")
+	grottoOutput, palaceOutput := filepath.Join(workDir, "grotto.pic"), filepath.Join(workDir, "palace.pic")
+	grottoStdout, grottoStderr, err := run(grottoBin, workDir, "link", specPath, objectPath, grottoOutput)
+	if err != nil {
+		t.Fatalf("Crystal Grotto hook resolution failed: %v\nstdout:\n%s\nstderr:\n%s", err, grottoStdout, grottoStderr)
+	}
+	palaceStdout, palaceStderr, err := run(java, workDir, "-jar", palaceJAR, "link", specPath, objectPath, palaceOutput)
+	if err != nil {
+		t.Fatalf("Crystal Palace hook resolution failed: %v\nstdout:\n%s\nstderr:\n%s", err, palaceStdout, palaceStderr)
+	}
+	if !bytes.Equal(grottoStdout, palaceStdout) || !bytes.Equal(grottoStderr, palaceStderr) {
+		t.Fatalf("hook-resolver process output differs\nGrotto stdout: %q\nPalace stdout: %q\nGrotto stderr: %q\nPalace stderr: %q",
+			grottoStdout, palaceStdout, grottoStderr, palaceStderr)
+	}
+	if bytes.Equal(readOutput(t, grottoOutput), readOutput(t, palaceOutput)) {
+		t.Log("hook-resolver outputs happened to be byte-identical; semantic execution remains authoritative")
+	}
+	executePICOutputs(t, workDir, []picExecution{
+		{name: "Crystal Grotto hook resolver", path: grottoOutput},
+		{name: "Crystal Palace hook resolver", path: palaceOutput},
+	})
+}
+
+func TestISEDDeterministicCompatibility(t *testing.T) {
+	palaceJAR := requireArtifact(t, palaceJAREnv, false)
+	grottoBin := requireArtifact(t, grottoBinEnv, true)
+	java, err := exec.LookPath("java")
+	if err != nil {
+		t.Fatalf("compat build tag requires java in PATH: %v", err)
+	}
+	compiler, err := exec.LookPath("x86_64-w64-mingw32-gcc")
+	if err != nil {
+		t.Fatalf("compat build tag requires x86_64-w64-mingw32-gcc in PATH: %v", err)
+	}
+	root := repositoryRoot(t)
+	fixtures := filepath.Join(root, "testdata", "modules", "coff")
+	workDir := t.TempDir()
+	objectPath := filepath.Join(workDir, "ised.x64.o")
+	compile := exec.Command(compiler, "-c", "-o", objectPath, filepath.Join(fixtures, "ised.x64.S"))
+	compile.Dir = workDir
+	if output, err := compile.CombinedOutput(); err != nil {
+		t.Fatalf("compile ISED COFF fixture: %v\n%s", err, output)
+	}
+
+	for _, test := range []struct {
+		name string
+		spec string
+	}{
+		{name: "replace", spec: "ised.spec"},
+		{name: "split healing", spec: "ised-split.spec"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			specPath := filepath.Join(fixtures, test.spec)
+			grottoOutput := filepath.Join(workDir, strings.ReplaceAll(test.name, " ", "-")+"-grotto.pic")
+			palaceOutput := filepath.Join(workDir, strings.ReplaceAll(test.name, " ", "-")+"-palace.pic")
+			grottoStdout, grottoStderr, err := run(grottoBin, workDir, "link", specPath, objectPath, grottoOutput, "REPLACEMENT=90")
+			if err != nil {
+				t.Fatalf("Crystal Grotto ISED failed: %v\nstdout:\n%s\nstderr:\n%s", err, grottoStdout, grottoStderr)
+			}
+			palaceStdout, palaceStderr, err := run(java, workDir, "-jar", palaceJAR, "link", specPath, objectPath, palaceOutput, "REPLACEMENT=90")
+			if err != nil {
+				t.Fatalf("Crystal Palace ISED failed: %v\nstdout:\n%s\nstderr:\n%s", err, palaceStdout, palaceStderr)
+			}
+			if !bytes.Equal(grottoStdout, palaceStdout) || !bytes.Equal(grottoStderr, palaceStderr) {
+				t.Fatalf("ISED process output differs\nGrotto stdout: %q\nPalace stdout: %q\nGrotto stderr: %q\nPalace stderr: %q",
+					grottoStdout, palaceStdout, grottoStderr, palaceStderr)
+			}
+			if got, want := readOutput(t, grottoOutput), readOutput(t, palaceOutput); !bytes.Equal(got, want) {
+				t.Fatalf("ISED output differs\nGrotto: %x\nPalace: %x", got, want)
+			}
+		})
+	}
+}
+
+func TestLengthChangingIntrinsicCompatibility(t *testing.T) {
+	palaceJAR := requireArtifact(t, palaceJAREnv, false)
+	grottoBin := requireArtifact(t, grottoBinEnv, true)
+	java, err := exec.LookPath("java")
+	if err != nil {
+		t.Fatalf("compat build tag requires java in PATH: %v", err)
+	}
+	compiler, err := exec.LookPath("x86_64-w64-mingw32-gcc")
+	if err != nil {
+		t.Fatalf("compat build tag requires x86_64-w64-mingw32-gcc in PATH: %v", err)
+	}
+	root := repositoryRoot(t)
+	fixtures := filepath.Join(root, "testdata", "modules", "coff")
+	workDir := t.TempDir()
+	objectPath := filepath.Join(workDir, "intrinsic.x64.o")
+	compile := exec.Command(compiler, "-c", "-o", objectPath, filepath.Join(fixtures, "intrinsic.x64.S"))
+	compile.Dir = workDir
+	if output, err := compile.CombinedOutput(); err != nil {
+		t.Fatalf("compile intrinsic COFF fixture: %v\n%s", err, output)
+	}
+
+	specPath := filepath.Join(fixtures, "intrinsic.spec")
+	grottoOutput, palaceOutput := filepath.Join(workDir, "grotto.pic"), filepath.Join(workDir, "palace.pic")
+	replacement := "REPLACEMENT=b82a00000090"
+	grottoStdout, grottoStderr, err := run(grottoBin, workDir, "link", specPath, objectPath, grottoOutput, replacement)
+	if err != nil {
+		t.Fatalf("Crystal Grotto intrinsic expansion failed: %v\nstdout:\n%s\nstderr:\n%s", err, grottoStdout, grottoStderr)
+	}
+	palaceStdout, palaceStderr, err := run(java, workDir, "-jar", palaceJAR, "link", specPath, objectPath, palaceOutput, replacement)
+	if err != nil {
+		t.Fatalf("Crystal Palace intrinsic expansion failed: %v\nstdout:\n%s\nstderr:\n%s", err, palaceStdout, palaceStderr)
+	}
+	if !bytes.Equal(grottoStdout, palaceStdout) || !bytes.Equal(grottoStderr, palaceStderr) {
+		t.Fatalf("intrinsic process output differs\nGrotto stdout: %q\nPalace stdout: %q\nGrotto stderr: %q\nPalace stderr: %q",
+			grottoStdout, palaceStdout, grottoStderr, palaceStderr)
+	}
+	if got, want := readOutput(t, grottoOutput), readOutput(t, palaceOutput); !bytes.Equal(got, want) {
+		t.Fatalf("intrinsic output differs\nGrotto: %x\nPalace: %x", got, want)
+	}
+}
+
+func TestTransferIntrinsicCompatibility(t *testing.T) {
+	palaceJAR := requireArtifact(t, palaceJAREnv, false)
+	grottoBin := requireArtifact(t, grottoBinEnv, true)
+	java, err := exec.LookPath("java")
+	if err != nil {
+		t.Fatalf("compat build tag requires java in PATH: %v", err)
+	}
+	compiler, err := exec.LookPath("x86_64-w64-mingw32-gcc")
+	if err != nil {
+		t.Fatalf("compat build tag requires x86_64-w64-mingw32-gcc in PATH: %v", err)
+	}
+	root := repositoryRoot(t)
+	fixtures := filepath.Join(root, "testdata", "modules", "coff")
+	workDir := t.TempDir()
+	objectPath := filepath.Join(workDir, "transfer.x64.o")
+	compile := exec.Command(compiler, "-c", "-o", objectPath, filepath.Join(fixtures, "transfer.x64.S"))
+	compile.Dir = workDir
+	if output, err := compile.CombinedOutput(); err != nil {
+		t.Fatalf("compile transfer COFF fixture: %v\n%s", err, output)
+	}
+
+	specPath := filepath.Join(fixtures, "transfer.spec")
+	grottoOutput, palaceOutput := filepath.Join(workDir, "grotto.pic"), filepath.Join(workDir, "palace.pic")
+	grottoStdout, grottoStderr, err := run(grottoBin, workDir, "link", specPath, objectPath, grottoOutput)
+	if err != nil {
+		t.Fatalf("Crystal Grotto transfer expansion failed: %v\nstdout:\n%s\nstderr:\n%s", err, grottoStdout, grottoStderr)
+	}
+	palaceStdout, palaceStderr, err := run(java, workDir, "-jar", palaceJAR, "link", specPath, objectPath, palaceOutput)
+	if err != nil {
+		t.Fatalf("Crystal Palace transfer expansion failed: %v\nstdout:\n%s\nstderr:\n%s", err, palaceStdout, palaceStderr)
+	}
+	if !bytes.Equal(grottoStdout, palaceStdout) || !bytes.Equal(grottoStderr, palaceStderr) {
+		t.Fatalf("transfer process output differs\nGrotto stdout: %q\nPalace stdout: %q\nGrotto stderr: %q\nPalace stderr: %q",
+			grottoStdout, palaceStdout, grottoStderr, palaceStderr)
+	}
+	if got, want := readOutput(t, grottoOutput), readOutput(t, palaceOutput); !bytes.Equal(got, want) {
+		t.Fatalf("transfer output differs\nGrotto: %x\nPalace: %x", got, want)
+	}
+	executePICOutputs(t, workDir, []picExecution{
+		{name: "Crystal Grotto transfer", path: grottoOutput},
+		{name: "Crystal Palace transfer", path: palaceOutput},
+	})
+}
+
+type picExecution struct {
+	name string
+	path string
+}
+
+func executePICOutputs(t *testing.T, workDir string, generated []picExecution) {
+	t.Helper()
 	if runtime.GOARCH != "amd64" {
-		t.Logf("generated both DFR programs; execution check requires an amd64 host (running %s)", runtime.GOARCH)
+		t.Logf("generated PIC programs; execution check requires an amd64 host (running %s)", runtime.GOARCH)
 		return
 	}
 	hostCompiler, err := exec.LookPath("cc")
@@ -246,19 +441,13 @@ func TestDFRSemanticCompatibility(t *testing.T) {
 	if output, err := hostBuild.CombinedOutput(); err != nil {
 		t.Fatalf("compile PIC runner: %v\n%s", err, output)
 	}
-	for _, generated := range []struct {
-		name string
-		path string
-	}{
-		{name: "Crystal Grotto", path: grottoOutput},
-		{name: "Crystal Palace", path: palaceOutput},
-	} {
-		stdout, stderr, err := run(runner, workDir, generated.path)
+	for _, output := range generated {
+		stdout, stderr, err := run(runner, workDir, output.path)
 		if err != nil {
-			t.Fatalf("execute %s DFR PIC: %v\nstdout:\n%s\nstderr:\n%s", generated.name, err, stdout, stderr)
+			t.Fatalf("execute %s PIC: %v\nstdout:\n%s\nstderr:\n%s", output.name, err, stdout, stderr)
 		}
 		if string(stdout) != "42\n" || len(stderr) != 0 {
-			t.Fatalf("%s DFR PIC result: stdout=%q stderr=%q", generated.name, stdout, stderr)
+			t.Fatalf("%s PIC result: stdout=%q stderr=%q", output.name, stdout, stderr)
 		}
 	}
 }
@@ -372,6 +561,16 @@ func compatibilityCases(t *testing.T, root string) []compatibilityCase {
 		return decoded
 	}
 	config := "@" + filepath.Join(root, "config.spec")
+	hookConfig := "@" + filepath.Join(root, "spec-runtime", "hooks.config.spec")
+	canonicalFirst, err := filepath.EvalSymlinks(filepath.Join(root, "spec-runtime", "canonical", "first.marker"))
+	if err != nil {
+		t.Fatalf("canonicalize first resolve fixture: %v", err)
+	}
+	canonicalSecond, err := filepath.EvalSymlinks(filepath.Join(root, "spec-runtime", "canonical", "second.marker"))
+	if err != nil {
+		t.Fatalf("canonicalize second resolve fixture: %v", err)
+	}
+	resolvedList := []byte(canonicalFirst + ", " + canonicalSecond + "\x00")
 	return []compatibilityCase{
 		{name: "passthrough_x86", specPath: filepath.Join(root, "passthrough.spec"), arch: "x86", extraArgs: []string{"PAYLOAD=000102feff"}, want: decode("000102feff")},
 		{name: "passthrough_x64", specPath: filepath.Join(root, "passthrough.spec"), arch: "x64", extraArgs: []string{"$PAYLOAD=000102feff"}, want: decode("000102feff")},
@@ -381,6 +580,10 @@ func compatibilityCases(t *testing.T, root string) []compatibilityCase {
 		{name: "transform_x64", specPath: filepath.Join(root, "transform.spec"), arch: "x64", want: decode("050000000f1f2d3d4b")},
 		{name: "config_and_call_x86", specPath: filepath.Join(root, "main.spec"), arch: "x86", extraArgs: []string{config}, want: decode("cafe67726f74746f00")},
 		{name: "config_and_call_x64", specPath: filepath.Join(root, "main.spec"), arch: "x64", extraArgs: []string{config}, want: decode("cafe67726f74746f00")},
+		{name: "config_hooks_x86", specPath: filepath.Join(root, "spec-runtime", "hooks-main.spec"), arch: "x86", extraArgs: []string{hookConfig}, want: decode("0f1e2d")},
+		{name: "config_hooks_x64", specPath: filepath.Join(root, "spec-runtime", "hooks-main.spec"), arch: "x64", extraArgs: []string{hookConfig}, want: decode("0f1e2d")},
+		{name: "resolve_file_list_x86", specPath: filepath.Join(root, "spec-runtime", "resolve-list.spec"), arch: "x86", want: resolvedList},
+		{name: "resolve_file_list_x64", specPath: filepath.Join(root, "spec-runtime", "resolve-list.spec"), arch: "x64", want: resolvedList},
 	}
 }
 

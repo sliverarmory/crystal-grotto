@@ -45,8 +45,10 @@ type Handler struct {
 	rulesMu       sync.Mutex
 	generateRules bool
 	rules         []byte
-	ruleWarnings  []rulegen.Warning
 	rulesErr      error
+
+	diagnosticsMu   sync.Mutex
+	diagnosticFiles map[string]struct{}
 }
 
 // New constructs the default object/linker command handler.
@@ -55,6 +57,7 @@ func New() *Handler {
 		marshalCOFF:     defaultCOFFMarshaler,
 		newDisassembler: defaultDisassemblerFactory,
 		stdout:          os.Stdout,
+		diagnosticFiles: make(map[string]struct{}),
 	}
 }
 
@@ -79,7 +82,6 @@ func (h *Handler) RequestRuleGeneration() {
 	h.rulesMu.Lock()
 	h.generateRules = true
 	h.rules = nil
-	h.ruleWarnings = nil
 	h.rulesErr = nil
 	h.rulesMu.Unlock()
 }
@@ -98,7 +100,6 @@ func (h *Handler) appendRuleGeneration(result rulegen.Result, err error) {
 		return
 	}
 	h.rules = append(h.rules, result.YARA...)
-	h.ruleWarnings = append(h.ruleWarnings, result.Warnings...)
 }
 
 // Handle implements deterministic Crystal Palace object commands.
@@ -198,15 +199,29 @@ func (h *Handler) Handle(context *spec.ExecutionContext, command *spec.Command, 
 	case "ised":
 		return true, h.handleISED(context, command, arguments)
 	case "linkpost":
-		if err := h.validateDeferred(context, command, arguments); err != nil {
-			return true, err
-		}
-		return true, deferArtifactCommand(context, command, arguments, true)
+		return true, h.handleLinkPost(context, command, arguments)
 	case "modcall":
 		return true, &UnsupportedError{Features: []string{"modcall"}}
 	default:
 		return false, nil
 	}
+}
+
+func (h *Handler) handleLinkPost(execution *spec.ExecutionContext, command *spec.Command, arguments []string) error {
+	if err := requireArguments(command.Name(), arguments, 2, 2); err != nil {
+		return err
+	}
+	if arguments[1] != "unwind" {
+		return fmt.Errorf("Invalid linkpost key %q", arguments[1])
+	}
+	return mutateArtifact(execution, func(artifact *Artifact) error {
+		if artifact.kind != KindPIC && artifact.kind != KindPIC64 {
+			return errors.New("linkpost is PIC-only")
+		}
+		artifact.addOptions([]string{"+unwind"})
+		artifact.setLinkPost(arguments[0])
+		return nil
+	})
 }
 
 func (h *Handler) handleISED(execution *spec.ExecutionContext, command *spec.Command, arguments []string) error {
@@ -540,10 +555,6 @@ func (h *Handler) validateDeferred(context *spec.ExecutionContext, command *spec
 				return err
 			}
 		}
-	case "linkpost":
-		if len(arguments) == 2 && arguments[1] != "unwind" {
-			return fmt.Errorf("Invalid linkpost key %q", arguments[1])
-		}
 	}
 	return nil
 }
@@ -674,26 +685,46 @@ func diagnosticOutput(path string) (*DiagnosticOutput, error) {
 	if path == "STDOUT" {
 		return &DiagnosticOutput{Stdout: true}, nil
 	}
-	absolute, err := filepath.Abs(path)
+	canonical, err := canonicalOutputPath(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve output path %q: %w", path, err)
 	}
-	if info, statErr := os.Stat(absolute); statErr == nil {
+	if info, statErr := os.Stat(canonical); statErr == nil {
 		if info.IsDir() {
-			return nil, fmt.Errorf("Out file is a folder %s", absolute)
+			return nil, fmt.Errorf("Out file is a folder %s", canonical)
 		}
 		if info.Mode().Perm()&0o222 == 0 {
-			return nil, fmt.Errorf("Out file is not writable %s", absolute)
+			return nil, fmt.Errorf("Out file is not writable %s", canonical)
 		}
 	} else if !os.IsNotExist(statErr) {
-		return nil, fmt.Errorf("inspect output file %s: %w", absolute, statErr)
+		return nil, fmt.Errorf("inspect output file %s: %w", canonical, statErr)
 	}
-	parent, err := os.Stat(filepath.Dir(absolute))
+	parent, err := os.Stat(filepath.Dir(canonical))
 	if err != nil {
-		return nil, fmt.Errorf("inspect output directory for %s: %w", absolute, err)
+		return nil, fmt.Errorf("inspect output directory for %s: %w", canonical, err)
 	}
 	if !parent.IsDir() {
-		return nil, fmt.Errorf("output parent is not a folder %s", filepath.Dir(absolute))
+		return nil, fmt.Errorf("output parent is not a folder %s", filepath.Dir(canonical))
 	}
-	return &DiagnosticOutput{Path: absolute}, nil
+	return &DiagnosticOutput{Path: canonical}, nil
+}
+
+func canonicalOutputPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	absolute = filepath.Clean(absolute)
+	canonical, err := filepath.EvalSymlinks(absolute)
+	if err == nil {
+		return filepath.Clean(canonical), nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(absolute)), nil
 }

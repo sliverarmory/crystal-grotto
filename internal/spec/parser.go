@@ -7,6 +7,7 @@ package spec
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -256,7 +257,7 @@ func (p *parser) parseOne(label, text string, line int) {
 				if !filepath.IsAbs(path) {
 					path = filepath.Join(filepath.Dir(p.file), path)
 				}
-				canonical, err := filepath.Abs(path)
+				canonical, err := canonicalPathAllowMissing(path)
 				if err != nil {
 					p.error(line, "Could not canonicalize: %s(%s) for callnear", args[0], err)
 					return
@@ -321,6 +322,46 @@ func (p *parser) parseOne(label, text string, line int) {
 		p.error(line, "Command %s missing arguments, try '%s'", name, hint)
 	} else {
 		p.error(line, "Command %s invalid arguments, try '%s'", name, hint)
+	}
+}
+
+// canonicalPathAllowMissing matches File.getCanonicalPath for callnear: it
+// resolves symlinks in the existing portion of a path without requiring the
+// final file to exist at parse time. The rewritten call performs normal input
+// validation when the specification executes.
+func canonicalPathAllowMissing(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	canonical, err := filepath.EvalSymlinks(abs)
+	if err == nil {
+		return filepath.Clean(canonical), nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+
+	current := abs
+	var suffix []string
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return abs, nil
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+		canonical, err = filepath.EvalSymlinks(current)
+		if err == nil {
+			for index := len(suffix) - 1; index >= 0; index-- {
+				canonical = filepath.Join(canonical, suffix[index])
+			}
+			return filepath.Clean(canonical), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", err
+		}
 	}
 }
 

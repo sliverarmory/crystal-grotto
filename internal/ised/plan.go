@@ -68,6 +68,11 @@ type Instruction struct {
 	Bytes    []byte
 	Form     string
 	Assembly string
+	// Mnemonic is the normalized uppercase instruction mnemonic. Incomplete is
+	// set by the COFF lifter when Capstone proved an instruction boundary but
+	// the available raw-byte decoder could not prove every Iced match key.
+	Mnemonic   string
+	Incomplete bool
 
 	HasRelocation bool
 	PointerFix    bool
@@ -75,6 +80,36 @@ type Instruction struct {
 	FlagProducer  bool
 	FlagConsumer  bool
 	Bookend       bool
+
+	// PC-relative metadata is populated only from proven raw encodings. It is
+	// consumed by the object rebaser and is not inferred from formatted
+	// operands. PCRelativeUnknown records a conservative Capstone signal that
+	// forces length-changing rewrites to fail closed.
+	PCRelative        bool
+	PCRelativeUnknown bool
+	RelativeOffset    uint8
+	RelativeWidth     uint8
+	RelativeTarget    uint32
+	// RelativeTargetBefore selects the function/data label placed before an
+	// instruction's prepend phase. It is true for upstream LocalLabels targets
+	// (near calls, named jumps, and supported RIP-relative references). Ordinary
+	// branch labels are placed after the prepend phase.
+	RelativeTargetBefore bool
+
+	// The remaining fields are raw-decoder facts used by the built-in analyses.
+	// They deliberately remain package-private so callers cannot accidentally
+	// present formatted operand guesses as authoritative Iced semantics.
+	operand0       string
+	operand1       string
+	memoryBase     string
+	writesFlags    bool
+	readsFlags     bool
+	unknownFlags   bool
+	repPrefix      bool
+	controlFlow    bool
+	unconditional  bool
+	call           bool
+	relativeMemory bool
 }
 
 // Function is one pattern-matching boundary. Patterns never cross functions.
@@ -120,6 +155,7 @@ type Edit struct {
 // Plan is a deterministic snapshot once its injected randomness is fixed.
 type Plan struct {
 	Machine coff.Machine
+	Unwind  bool
 	Edits   []Edit
 }
 
@@ -164,9 +200,9 @@ func BuildPlan(program Program, configuration Configuration, options PlanOptions
 		return Plan{}, fmt.Errorf("%w: %s", ErrUnsupportedMachine, program.Machine)
 	}
 	if configuration.IsEmpty() {
-		return Plan{Machine: program.Machine, Edits: []Edit{}}, nil
+		return Plan{Machine: program.Machine, Unwind: options.Unwind, Edits: []Edit{}}, nil
 	}
-	if err := validateProgram(program); err != nil {
+	if err := validateProgram(program, configuration); err != nil {
 		return Plan{}, err
 	}
 
@@ -180,7 +216,7 @@ func BuildPlan(program Program, configuration Configuration, options PlanOptions
 		random = cryptorand.Reader
 	}
 
-	plan := Plan{Machine: program.Machine, Edits: make([]Edit, 0)}
+	plan := Plan{Machine: program.Machine, Unwind: options.Unwind, Edits: make([]Edit, 0)}
 	for _, function := range program.Functions {
 		bags := make([]instructionBags, len(function.Instructions))
 		for start := range function.Instructions {
@@ -256,11 +292,21 @@ func walkMatches(root *matchNode, instructions []Instruction, start, position in
 }
 
 func instructionKeys(instruction Instruction) []string {
-	mnemonic := instruction.Form
-	if index := strings.IndexByte(mnemonic, ' '); index >= 0 {
-		mnemonic = mnemonic[:index]
+	keys := make([]string, 0, 3)
+	if instruction.Form != "" {
+		keys = append(keys, instruction.Form)
+		mnemonic := instruction.Form
+		if index := strings.IndexByte(mnemonic, ' '); index >= 0 {
+			mnemonic = mnemonic[:index]
+		}
+		keys = append(keys, mnemonic)
+	} else if instruction.Mnemonic != "" {
+		keys = append(keys, instruction.Mnemonic)
 	}
-	return []string{instruction.Form, mnemonic, instruction.Assembly}
+	if instruction.Assembly != "" {
+		keys = append(keys, instruction.Assembly)
+	}
+	return keys
 }
 
 func selectCommand(commands []Command, candidates []int, kind bagKind, instruction Instruction, unwind bool, random io.Reader) (*Selection, error) {
@@ -323,7 +369,7 @@ func randomIndex(random io.Reader, count int) (int, error) {
 	}
 }
 
-func validateProgram(program Program) error {
+func validateProgram(program Program, configuration Configuration) error {
 	functionNames := make(map[string]struct{}, len(program.Functions))
 	type span struct {
 		start uint32
@@ -349,11 +395,15 @@ func validateProgram(program Program) error {
 			if len(instruction.Bytes) == 0 || len(instruction.Bytes) > 15 {
 				return fmt.Errorf("%w: %s instruction %d has %d bytes", ErrInvalidProgram, function.Name, instructionIndex, len(instruction.Bytes))
 			}
-			if instruction.Form == "" {
-				return boundary("canonical opcode form")
-			}
-			if instruction.Assembly == "" {
-				return boundary("MASM instruction rendering")
+			if !instruction.Incomplete {
+				if instruction.Form == "" {
+					return boundary("canonical opcode form")
+				}
+				if instruction.Assembly == "" {
+					return boundary("MASM instruction rendering")
+				}
+			} else if err := validateIncompleteInstruction(function, instruction, configuration); err != nil {
+				return err
 			}
 			end := uint64(instruction.Offset) + uint64(len(instruction.Bytes))
 			if end > uint64(math.MaxUint32)+1 {
@@ -375,6 +425,56 @@ func validateProgram(program Program) error {
 		}
 	}
 	return nil
+}
+
+func validateIncompleteInstruction(function Function, instruction Instruction, configuration Configuration) error {
+	mnemonic := strings.ToUpper(instruction.Mnemonic)
+	for _, command := range configuration.commands {
+		for _, pattern := range command.Patterns {
+			if instruction.Form != "" && (pattern == instruction.Form || pattern == formMnemonic(instruction.Form)) {
+				continue
+			}
+			if instruction.Form != "" && patternHasUpperMnemonic(pattern) {
+				// Canonical Iced forms are uppercase. Once the current form is
+				// known, a different uppercase form is a proven non-match even
+				// when the exact MASM rendering is unavailable.
+				continue
+			}
+			if pattern == mnemonic {
+				continue
+			}
+			if instruction.Assembly != "" && pattern == instruction.Assembly {
+				continue
+			}
+			if mnemonic == "" || patternMnemonic(pattern) == mnemonic {
+				return &BoundaryError{
+					Function: function.Name, Section: function.Section, Offset: instruction.Offset,
+					Feature: "Iced match keys for " + mnemonic, Err: ErrSemanticDetailUnavailable,
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func formMnemonic(form string) string {
+	if index := strings.IndexByte(form, ' '); index >= 0 {
+		return form[:index]
+	}
+	return form
+}
+
+func patternMnemonic(pattern string) string {
+	fields := strings.Fields(pattern)
+	if len(fields) == 0 {
+		return ""
+	}
+	return strings.ToUpper(fields[0])
+}
+
+func patternHasUpperMnemonic(pattern string) bool {
+	fields := strings.Fields(pattern)
+	return len(fields) != 0 && fields[0] == strings.ToUpper(fields[0])
 }
 
 func cloneInstruction(value Instruction) Instruction {
@@ -401,7 +501,7 @@ func cloneSelection(value *Selection) *Selection {
 }
 
 func clonePlan(value Plan) Plan {
-	result := Plan{Machine: value.Machine, Edits: make([]Edit, len(value.Edits))}
+	result := Plan{Machine: value.Machine, Unwind: value.Unwind, Edits: make([]Edit, len(value.Edits))}
 	for index, edit := range value.Edits {
 		result.Edits[index] = edit
 		result.Edits[index].Original = cloneInstruction(edit.Original)

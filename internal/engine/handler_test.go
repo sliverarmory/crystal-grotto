@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/sliverarmory/crystal-grotto/internal/coff"
 	"github.com/sliverarmory/crystal-grotto/internal/coffwrite"
+	crystalhash "github.com/sliverarmory/crystal-grotto/internal/hash"
 	"github.com/sliverarmory/crystal-grotto/internal/linker"
 	"github.com/sliverarmory/crystal-grotto/internal/spec"
 	"github.com/sliverarmory/crystal-grotto/internal/x86"
@@ -87,6 +89,26 @@ func TestHandlerExportsEveryObjectKind(t *testing.T) {
 			output := runEngineSpec(t, "x64", "x64:\n  push $INPUT\n  make "+test.kind+"\n  export\n", spec.Environment{"$INPUT": input}, New())
 			test.check(t, output)
 		})
+	}
+}
+
+func TestArtifactExportRedeclarationMatchesUpstream(t *testing.T) {
+	t.Parallel()
+	artifact := newArtifact(KindObject, nil)
+	if err := artifact.setExport(linker.Export{Symbol: "one", Tag: 0x100}); err != nil {
+		t.Fatal(err)
+	}
+	if err := artifact.setExport(linker.Export{Symbol: "one", Tag: 0x100}); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("same export/tag redeclaration error = %v", err)
+	}
+	if err := artifact.setExport(linker.Export{Symbol: "one", Tag: 0x101}); err != nil {
+		t.Fatalf("replacement export tag: %v", err)
+	}
+	if got := artifact.config.exports; len(got) != 1 || got[0].Symbol != "one" || got[0].Tag != 0x101 {
+		t.Fatalf("replaced exports = %#v", got)
+	}
+	if err := artifact.setExport(linker.Export{Symbol: "two", Tag: 0x101}); err == nil || !strings.Contains(err.Error(), "conflicts") {
+		t.Fatalf("cross-symbol tag collision error = %v", err)
 	}
 }
 
@@ -286,16 +308,16 @@ func TestHandlerOrderOptionsAndUnsupportedConfiguration(t *testing.T) {
 		}
 	})
 
-	t.Run("unsupported", func(t *testing.T) {
+	t.Run("unwind leaf", func(t *testing.T) {
 		t.Parallel()
 		object := textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0))
-		err := runEngineSpecError(t, "x64", `x64:
+		output := runEngineSpec(t, "x64", `x64:
   push $INPUT
   make pic +unwind
   export
 `, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
-		if !strings.Contains(err.Error(), "unsupported configured feature(s): +unwind") {
-			t.Fatalf("error = %v", err)
+		if !bytes.Equal(output, []byte{0xc3}) {
+			t.Fatalf("+unwind leaf output = %x", output)
 		}
 	})
 
@@ -469,6 +491,157 @@ func TestHandlerMutateOptionUsesConfiguredMagic(t *testing.T) {
 	}
 }
 
+func TestHandlerRegDanceOption(t *testing.T) {
+	code := []byte{
+		0x55, 0x53, 0x56, 0x57,
+		0x89, 0xf3,
+		0x8d, 0x7c, 0x5d, 0x10,
+		0x01, 0xfe,
+		0x5f, 0x5e, 0x5b, 0x5d, 0xc3, 0x90, 0x90, 0x90,
+	}
+	object := textObject(t, coff.MachineI386, code, function("_go", 0))
+	handler := New()
+	handler.random = bytes.NewReader(make([]byte, 64))
+	output := runEngineSpec(t, "x86", `x86:
+  push $INPUT
+  make pic +regdance
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, handler)
+	if bytes.Equal(output, code) || len(output) != len(code) {
+		t.Fatalf("+regdance output = %x, input = %x", output, code)
+	}
+	if !bytes.Equal(output[:4], code[:4]) || !bytes.Equal(output[12:], code[12:]) {
+		t.Fatalf("+regdance changed function bookends: %x", output)
+	}
+}
+
+func TestHandlerStructuralTransformOptions(t *testing.T) {
+	code := []byte{
+		0x83, 0xf9, 0x00, 0x74, 0x07,
+		0xb8, 0x01, 0x00, 0x00, 0x00, 0xeb, 0x05,
+		0xb8, 0x02, 0x00, 0x00, 0x00, 0xc3,
+		0x85, 0xd2, 0x75, 0x03, 0x31, 0xc0, 0xc3,
+		0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3, 0x90,
+	}
+	input := marshalTestObject(t, textObject(t, coff.MachineAMD64, code,
+		function("go", 0), function("helper", 0x12)))
+	run := func(options string) []byte {
+		handler := New()
+		handler.random = bytes.NewReader(make([]byte, 256))
+		return runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic `+options+`
+  export
+`, spec.Environment{"$INPUT": input}, handler)
+	}
+
+	blockOutput := run("+blockparty")
+	if bytes.Equal(blockOutput, code) {
+		t.Fatal("+blockparty left the eligible input unchanged")
+	}
+	shatterOutput := run("+shatter")
+	if bytes.Equal(shatterOutput, code) {
+		t.Fatal("+shatter left the eligible input unchanged")
+	}
+	if both := run("+blockparty +shatter"); !bytes.Equal(both, shatterOutput) {
+		t.Fatalf("+shatter did not take precedence over +blockparty\nboth:    %x\nshatter: %x", both, shatterOutput)
+	}
+}
+
+func TestHandlerGeneratedUnwindOutputs(t *testing.T) {
+	object := textObject(t, coff.MachineAMD64, []byte{0x55, 0x5d, 0xc3}, function("go", 0))
+	if err := object.AddSymbol(&coff.Symbol{Name: "unwind_resource", StorageClass: coff.SymbolClassExternal}); err != nil {
+		t.Fatal(err)
+	}
+	input := marshalTestObject(t, object)
+
+	t.Run("COFF sections", func(t *testing.T) {
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make coff +unwind
+  export
+`, spec.Environment{"$INPUT": input}, New())
+		parsed, err := coff.Parse(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pdata := parsed.GetSection(".pdata")
+		var xdata *coff.Section
+		for _, section := range parsed.Sections {
+			if strings.HasPrefix(section.Name, ".xdata") {
+				xdata = section
+				break
+			}
+		}
+		if pdata == nil || xdata == nil || len(pdata.Data) != 12 || len(xdata.Data) != 8 {
+			t.Fatalf("generated unwind sections = %#v, %#v", pdata, xdata)
+		}
+		rows, err := coff.ParsePDATA(parsed)
+		if err != nil || len(rows) != 1 || rows[0].Function != "go" {
+			t.Fatalf("parsed unwind rows = %#v, %v", rows, err)
+		}
+	})
+
+	t.Run("PICO resource", func(t *testing.T) {
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make object +unwind
+  export
+`, spec.Environment{"$INPUT": input}, New())
+		header, err := linker.ParsePICOHeader(output)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if header.CodeLength <= 3 || header.ResourceOffset < linker.PICOHeaderSize {
+			t.Fatalf("PICO unwind header = %#v", header)
+		}
+		directives, err := linker.DecodeDirectives(output[linker.PICOHeaderSize:header.ResourceOffset])
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, directive := range directives {
+			if directive.Type == linker.PICOInstructionExport && len(directive.Data) >= 8 && binary.LittleEndian.Uint32(directive.Data[:4]) == linker.PICOUnwindExportTag {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("PICO directives omit unwind export: %#v", directives)
+		}
+	})
+
+	t.Run("PIC linkpost resource", func(t *testing.T) {
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic
+  linkpost "unwind_resource" "unwind"
+  export
+`, spec.Environment{"$INPUT": input}, New())
+		if len(output) != 32 || !bytes.Equal(output[:3], []byte{0x55, 0x5d, 0xc3}) {
+			t.Fatalf("PIC linkpost output = %x", output)
+		}
+		if got := binary.LittleEndian.Uint32(output[4:8]); got != 12 {
+			t.Fatalf("PIC linkpost pdata length = %d", got)
+		}
+		if got := binary.LittleEndian.Uint32(output[16:20]); got != 24 {
+			t.Fatalf("PIC linkpost xdata address = %#x, want %#x", got, 24)
+		}
+	})
+
+	t.Run("linkpost symbol may be introduced later", func(t *testing.T) {
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic
+  linkpost "late_resource" "unwind"
+  remap "unwind_resource" "late_resource"
+  export
+`, spec.Environment{"$INPUT": input}, New())
+		if len(output) != 32 || !bytes.Equal(output[:3], []byte{0x55, 0x5d, 0xc3}) {
+			t.Fatalf("deferred linkpost output = %x", output)
+		}
+	})
+}
+
 func TestHandlerRejectsDprintfReachableFromResolver(t *testing.T) {
 	t.Parallel()
 	object := textObject(t, coff.MachineAMD64,
@@ -496,7 +669,7 @@ func TestHandlerRejectsDprintfReachableFromResolver(t *testing.T) {
 func TestHandlerISEDValidatesAndRetainsResolvedBytes(t *testing.T) {
 	t.Parallel()
 	object := textObject(t, coff.MachineAMD64, []byte{0x53, 0x5b, 0xc3}, function("go", 0))
-	err := runEngineSpecError(t, "x64", `x64:
+	output := runEngineSpec(t, "x64", `x64:
   push $INPUT
   make pic
   ised replace "PUSH r64" $CODE +first
@@ -505,11 +678,23 @@ func TestHandlerISEDValidatesAndRetainsResolvedBytes(t *testing.T) {
 		"$INPUT": marshalTestObject(t, object),
 		"$CODE":  []byte{0x90},
 	}, New())
-	if !strings.Contains(err.Error(), "unsupported configured feature(s): ised") {
-		t.Fatalf("ised export error = %v", err)
+	if want := []byte{0x90, 0x5b, 0xc3}; !bytes.Equal(output, want) {
+		t.Fatalf("ised output = %x, want %x", output, want)
+	}
+	output = runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic
+  ised replace "PUSH r64" $CODE +first +split
+  export
+`, spec.Environment{
+		"$INPUT": marshalTestObject(t, object),
+		"$CODE":  []byte{0x90},
+	}, New())
+	if want := []byte{0x90, 0x5b, 0xc3}; !bytes.Equal(output, want) {
+		t.Fatalf("ised +split healed output = %x, want %x", output, want)
 	}
 
-	err = runEngineSpecError(t, "x64", `x64:
+	err := runEngineSpecError(t, "x64", `x64:
   push $INPUT
   make pic
   ised replace "PUSH r64" $MISSING
@@ -519,10 +704,10 @@ func TestHandlerISEDValidatesAndRetainsResolvedBytes(t *testing.T) {
 	}
 }
 
-func TestHandlerHookConfigurationAndEncoderBoundaries(t *testing.T) {
+func TestHandlerHookEncoding(t *testing.T) {
 	t.Parallel()
 
-	t.Run("attach import is explicit", func(t *testing.T) {
+	t.Run("attach import", func(t *testing.T) {
 		t.Parallel()
 		object := textObject(t, coff.MachineAMD64,
 			[]byte{0xff, 0x15, 0, 0, 0, 0, 0xc3, 0xc3},
@@ -537,30 +722,36 @@ func TestHandlerHookConfigurationAndEncoderBoundaries(t *testing.T) {
 			Section: text, VirtualAddress: 2, SymbolName: imported.Name,
 			Symbol: imported, Type: coff.RelAMD64Rel32,
 		}}
-		err := runEngineSpecError(t, "x64", `x64:
+		output := runEngineSpec(t, "x64", `x64:
   push $INPUT
   make pic
   attach "KERNEL32$Sleep" "wrapper"
   export
 `, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
-		if !strings.Contains(err.Error(), "unsupported configured feature(s): attach") {
-			t.Fatalf("attach error = %v", err)
+		if want := []byte{0x90, 0xe8, 1, 0, 0, 0, 0xc3, 0xc3}; !bytes.Equal(output, want) {
+			t.Fatalf("attach output = %x, want %x", output, want)
 		}
 	})
 
-	t.Run("redirect is explicit", func(t *testing.T) {
+	t.Run("redirect local call", func(t *testing.T) {
 		t.Parallel()
-		object := textObject(t, coff.MachineAMD64, []byte{0xc3, 0xc3, 0xc3},
-			function("go", 0), function("target", 1), function("wrapper", 2),
+		object := textObject(t, coff.MachineAMD64, []byte{0xe8, 0, 0, 0, 0, 0xc3, 0xc3, 0xc3},
+			function("go", 0), function("target", 6), function("wrapper", 7),
 		)
-		err := runEngineSpecError(t, "x64", `x64:
+		text := object.GetSection(".text")
+		target := object.GetSymbol("target")
+		text.Relocations = []*coff.Relocation{{
+			Section: text, VirtualAddress: 1, SymbolName: target.Name,
+			Symbol: target, Type: coff.RelAMD64Rel32,
+		}}
+		output := runEngineSpec(t, "x64", `x64:
   push $INPUT
   make pic
   redirect "target" "wrapper"
   export
 `, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
-		if !strings.Contains(err.Error(), "unsupported configured feature(s): redirect") {
-			t.Fatalf("redirect error = %v", err)
+		if want := []byte{0xe8, 2, 0, 0, 0, 0xc3, 0xc3, 0xc3}; !bytes.Equal(output, want) {
+			t.Fatalf("redirect output = %x, want %x", output, want)
 		}
 	})
 
@@ -576,14 +767,95 @@ func TestHandlerHookConfigurationAndEncoderBoundaries(t *testing.T) {
 			Section: text, VirtualAddress: 1, SymbolName: intrinsic.Name,
 			Symbol: intrinsic, Type: coff.RelAMD64Rel32,
 		}}
-		err := runEngineSpecError(t, "x64", `x64:
+		output := runEngineSpec(t, "x64", `x64:
   push $INPUT
   make pic
   intrinsic "__custom" $CODE
   export
-`, spec.Environment{"$INPUT": marshalTestObject(t, object), "$CODE": []byte{0x31, 0xc0, 0xc3}}, New())
-		if !strings.Contains(err.Error(), "unsupported configured feature(s): intrinsic") {
-			t.Fatalf("intrinsic error = %v", err)
+		`, spec.Environment{"$INPUT": marshalTestObject(t, object), "$CODE": []byte{0x31, 0xc0, 0x90, 0x90, 0xc3}}, New())
+		if want := []byte{0x31, 0xc0, 0x90, 0x90, 0xc3, 0xc3}; !bytes.Equal(output, want) {
+			t.Fatalf("intrinsic output = %x, want %x", output, want)
+		}
+	})
+
+	t.Run("length-changing intrinsic bytes are rebuilt", func(t *testing.T) {
+		t.Parallel()
+		object := textObject(t, coff.MachineAMD64, []byte{0xe8, 0, 0, 0, 0, 0xc3}, function("go", 0))
+		intrinsic := &coff.Symbol{Name: "__custom", Type: coff.SymbolTypeFunction, StorageClass: coff.SymbolClassExternal}
+		if err := object.AddSymbol(intrinsic); err != nil {
+			t.Fatal(err)
+		}
+		text := object.GetSection(".text")
+		text.Relocations = []*coff.Relocation{{
+			Section: text, VirtualAddress: 1, SymbolName: intrinsic.Name,
+			Symbol: intrinsic, Type: coff.RelAMD64Rel32,
+		}}
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic
+  intrinsic "__custom" $CODE
+  export
+		`, spec.Environment{"$INPUT": marshalTestObject(t, object), "$CODE": []byte{0xb8, 0x2a, 0, 0, 0, 0x90}}, New())
+		if want := []byte{0xb8, 0x2a, 0, 0, 0, 0x90, 0xc3}; !bytes.Equal(output, want) {
+			t.Fatalf("length-changing intrinsic output = %x, want %x", output, want)
+		}
+	})
+
+	t.Run("transfer intrinsic emits the containing epilogue", func(t *testing.T) {
+		t.Parallel()
+		code := []byte{
+			0x53, 0x56, 0x48, 0x83, 0xec, 0x28,
+			0xe8, 0, 0, 0, 0, 0x90, 0xc3,
+		}
+		object := textObject(t, coff.MachineAMD64, code, function("go", 0))
+		intrinsic := &coff.Symbol{Name: "__transfer", Type: coff.SymbolTypeFunction, StorageClass: coff.SymbolClassExternal}
+		if err := object.AddSymbol(intrinsic); err != nil {
+			t.Fatal(err)
+		}
+		text := object.GetSection(".text")
+		text.Relocations = []*coff.Relocation{{
+			Section: text, VirtualAddress: 7, SymbolName: intrinsic.Name,
+			Symbol: intrinsic, Type: coff.RelAMD64Rel32,
+		}}
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+		want := []byte{
+			0x53, 0x56, 0x48, 0x83, 0xec, 0x28,
+			0x48, 0x83, 0xc4, 0x28, 0x5e, 0x5b, 0xff, 0xe1, 0xc3,
+		}
+		if !bytes.Equal(output, want) {
+			t.Fatalf("transfer output = %x, want %x", output, want)
+		}
+	})
+
+	t.Run("resolve hook intrinsic", func(t *testing.T) {
+		t.Parallel()
+		object := textObject(t, coff.MachineAMD64,
+			[]byte{0xe8, 0, 0, 0, 0, 0xc3, 0xb8, 0x2a, 0, 0, 0, 0xc3},
+			function("go", 0), function("wrapper", 6),
+		)
+		intrinsic := &coff.Symbol{Name: "__resolve_hook", Type: coff.SymbolTypeFunction, StorageClass: coff.SymbolClassExternal}
+		if err := object.AddSymbol(intrinsic); err != nil {
+			t.Fatal(err)
+		}
+		text := object.GetSection(".text")
+		text.Relocations = []*coff.Relocation{{
+			Section: text, VirtualAddress: 1, SymbolName: intrinsic.Name,
+			Symbol: intrinsic, Type: coff.RelAMD64Rel32,
+		}}
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic
+  addhook "KERNEL32$Sleep" "wrapper"
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+		hash := make([]byte, 4)
+		binary.LittleEndian.PutUint32(hash, (crystalhash.ROR13{}).Sum32([]byte("Sleep")))
+		if len(output) <= len(text.Data) || !bytes.Contains(output, hash) {
+			t.Fatalf("resolve-hook output = %x", output)
 		}
 	})
 }
@@ -623,6 +895,43 @@ func TestHandlerRunAndGenerateRules(t *testing.T) {
 		}
 		if len(result.Rules) != 0 {
 			t.Fatalf("rules = %x, want empty", result.Rules)
+		}
+	})
+
+	t.Run("warnings reach execution logger", func(t *testing.T) {
+		handler := New()
+		handler.ruleOptions.UUID = func() (string, error) { return "12345678-1234-4234-8234-123456789abc", nil }
+		object := marshalTestObject(t, textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0)))
+		program, err := spec.Parse("warnings.spec", `x64:
+  push $INPUT
+  make pic
+  rule "sample" 10 5 "10-16" "missing"
+  export
+`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var messages []spec.Message
+		result, err := program.RunAndGenerate(capability, spec.RunOptions{
+			Environment: spec.Environment{"$INPUT": object},
+			Handler:     handler,
+			Logger: spec.LoggerFunc(func(message spec.Message) {
+				messages = append(messages, message)
+			}),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(result.Rules) != 0 || len(messages) != 1 {
+			t.Fatalf("rules = %q, messages = %#v", result.Rules, messages)
+		}
+		if messages[0].Type != spec.MessageWarning || messages[0].Text != "sample_12345678: No invariant islands matching Yara rule generator criteria exist" {
+			t.Fatalf("warning messages = %#v", messages)
+		}
+		for _, message := range messages {
+			if message.File != "warnings.spec" || message.Target != "x64" {
+				t.Fatalf("warning context = %#v", message)
+			}
 		}
 	})
 
@@ -735,6 +1044,16 @@ func TestHandlerDiagnosticsAndValidation(t *testing.T) {
 			object:  textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0)),
 			program: "x64:\n  push $INPUT\n  make object\n  import \"GetProcAddress, LoadLibraryA\"\n  export\n", want: "LoadLibraryA is required as the first API entry",
 		},
+		{
+			name: "linkpost PICO", arch: "x64",
+			object:  textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0)),
+			program: "x64:\n  push $INPUT\n  make object\n  linkpost \"unwind\" \"unwind\"\n", want: "linkpost is PIC-only",
+		},
+		{
+			name: "linkpost key", arch: "x64",
+			object:  textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0)),
+			program: "x64:\n  push $INPUT\n  make pic\n  linkpost \"resource\" \"unknown\"\n", want: "Invalid linkpost key",
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -753,13 +1072,119 @@ func TestHandlerDiagnosticsAndValidation(t *testing.T) {
 	}
 }
 
+func TestHandlerDiagnosticsTruncateThenAppendCanonicalAliases(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	report := filepath.Join(directory, "combined.txt")
+	alias := filepath.Join(directory, "combined-alias.txt")
+	if err := os.WriteFile(report, []byte("stale diagnostic data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(report, alias); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+
+	first := filepath.Join(directory, "first.spec")
+	second := filepath.Join(directory, "second.spec")
+	if err := os.WriteFile(first, []byte("x64:\n  push $INPUT\n  make pic\n  coffparse \""+report+"\" \"first artifact\"\n  export\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("x64:\n  push $INPUT\n  make pic\n  coffparse \""+alias+"\" \"second artifact\"\n  export\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	object := marshalTestObject(t, textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0)))
+	runEngineSpecFile(t, filepath.Join(directory, "main.spec"), "x64", `x64:
+  run "first.spec"
+  pop $FIRST
+  run "second.spec"
+`, spec.Environment{"$INPUT": object}, New())
+
+	content, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(content, []byte("stale diagnostic data")) ||
+		bytes.Count(content, []byte("COFF Object (x64)")) != 2 ||
+		bytes.Index(content, []byte("first artifact")) >= bytes.Index(content, []byte("second artifact")) {
+		t.Fatalf("combined diagnostic output = %q", content)
+	}
+	canonicalReport, err := filepath.EvalSymlinks(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolvedAlias, err := diagnosticOutput(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolvedAlias.Path != canonicalReport {
+		t.Fatalf("canonical alias path = %q, want %q", resolvedAlias.Path, canonicalReport)
+	}
+}
+
+func TestHandlerDiagnosticWritesAreConcurrentSafe(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "concurrent.txt")
+	if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := diagnosticOutput(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := New()
+	const writers = 24
+	errors := make(chan error, writers)
+	var wait sync.WaitGroup
+	for index := 0; index < writers; index++ {
+		index := index
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			errors <- handler.writeDiagnostic(output, []byte(fmt.Sprintf("[%02d]", index)))
+		}()
+	}
+	wait.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(content, []byte("stale")) {
+		t.Fatalf("first diagnostic write did not truncate: %q", content)
+	}
+	for index := 0; index < writers; index++ {
+		token := []byte(fmt.Sprintf("[%02d]", index))
+		if bytes.Count(content, token) != 1 {
+			t.Fatalf("diagnostic token %q count in %q = %d, want 1", token, content, bytes.Count(content, token))
+		}
+	}
+
+	var stdout bytes.Buffer
+	handler.stdout = &stdout
+	if err := handler.writeDiagnostic(&DiagnosticOutput{Stdout: true}, []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := handler.writeDiagnostic(&DiagnosticOutput{Stdout: true}, []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "onetwo" {
+		t.Fatalf("STDOUT diagnostic = %q, want onetwo", stdout.String())
+	}
+}
+
 func TestArtifactConfigurationIsDefensiveAndDeterministic(t *testing.T) {
 	t.Parallel()
 	artifact := newArtifact(KindObject, textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0)))
 	artifact.addOptions([]string{"+optimize", "+gofirst", "+optimize"})
 	artifact.addStrip([]string{"z", "a", "z"})
 	artifact.setPatch("go", []byte{1})
-	artifact.setLink(linker.LinkedSection{Name: "blob", Data: []byte{2}})
+	artifact.setLink(linker.LinkedSection{Name: "blob", Data: []byte{2}, Relocations: []linker.LinkedRelocation{{SymbolName: ".text"}}})
+	artifact.setLinkPost("post")
 	artifact.config.getBSS = "getbss"
 	artifact.config.returnAddress = "getret"
 	artifact.deferCommand(DeferredCommand{Name: "protect", Arguments: []string{"go"}, AffectsProgram: true})
@@ -773,9 +1198,12 @@ func TestArtifactConfigurationIsDefensiveAndDeterministic(t *testing.T) {
 	}
 	configuration.Patches[0].Data[0] = 9
 	configuration.Links[0].Data[0] = 9
+	configuration.Links[0].Relocations[0].SymbolName = "changed"
+	configuration.LinkPosts[0] = "changed"
 	configuration.Deferred[0].Arguments[0] = "changed"
 	again := artifact.Configuration()
 	if again.Patches[0].Data[0] != 1 || again.Links[0].Data[0] != 2 || again.Deferred[0].Arguments[0] != "go" ||
+		again.Links[0].Relocations[0].SymbolName != ".text" || again.LinkPosts[0] != "post" ||
 		again.GetBSS != "getbss" || again.ReturnAddress != "getret" {
 		t.Fatalf("Configuration exposed mutable storage: %#v", again)
 	}

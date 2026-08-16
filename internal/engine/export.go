@@ -12,15 +12,25 @@ import (
 	"io"
 	"os"
 
+	"github.com/sliverarmory/crystal-grotto/internal/blockparty"
 	"github.com/sliverarmory/crystal-grotto/internal/btf"
 	"github.com/sliverarmory/crystal-grotto/internal/coff"
 	"github.com/sliverarmory/crystal-grotto/internal/coffwrite"
+	"github.com/sliverarmory/crystal-grotto/internal/hookencode"
+	"github.com/sliverarmory/crystal-grotto/internal/hookresolve"
+	"github.com/sliverarmory/crystal-grotto/internal/hooks"
+	"github.com/sliverarmory/crystal-grotto/internal/intrinsicexpand"
+	"github.com/sliverarmory/crystal-grotto/internal/ised"
 	"github.com/sliverarmory/crystal-grotto/internal/linker"
 	"github.com/sliverarmory/crystal-grotto/internal/mutate"
+	"github.com/sliverarmory/crystal-grotto/internal/regdance"
 	"github.com/sliverarmory/crystal-grotto/internal/resolver"
 	"github.com/sliverarmory/crystal-grotto/internal/rulegen"
 	"github.com/sliverarmory/crystal-grotto/internal/safety"
+	"github.com/sliverarmory/crystal-grotto/internal/shatter"
 	"github.com/sliverarmory/crystal-grotto/internal/spec"
+	"github.com/sliverarmory/crystal-grotto/internal/transfer"
+	"github.com/sliverarmory/crystal-grotto/internal/unwindgen"
 	"github.com/sliverarmory/crystal-grotto/internal/x86"
 )
 
@@ -52,8 +62,29 @@ func (h *Handler) export(execution *spec.ExecutionContext, artifact *Artifact) (
 	if err != nil {
 		return nil, err
 	}
-	if features := artifact.hookEncodingFeatures(normalized); len(features) != 0 {
-		return nil, &UnsupportedError{Features: features}
+	if artifact.config.hooks == nil {
+		return nil, errors.New("engine: hook model is not initialized")
+	}
+	normalized, hookReport, err := hookresolve.Apply(context.Background(), normalized, artifact.config.hooks, hookresolve.Options{Random: h.random})
+	if err != nil {
+		return nil, err
+	}
+	if hookReport.RewrittenSites != 0 {
+		normalized, err = linker.Merge(normalized)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if _, err := transfer.Apply(context.Background(), normalized, transfer.Options{}); err != nil {
+		return nil, err
+	}
+	normalized, _, err = intrinsicexpand.Apply(context.Background(), normalized, artifact.config.hooks, intrinsicexpand.Options{})
+	if err != nil {
+		return nil, err
+	}
+	normalized, _, err = hookencode.Apply(context.Background(), normalized, artifact.config.hooks)
+	if err != nil {
+		return nil, err
 	}
 	roots := artifact.config.resolvers.ResolverFunctions()
 	if artifact.config.getBSS != "" {
@@ -101,18 +132,84 @@ func (h *Handler) export(execution *spec.ExecutionContext, artifact *Artifact) (
 			return nil, err
 		}
 	}
+	if !artifact.config.ised.IsEmpty() {
+		normalized, _, _, err = ised.ApplyObject(context.Background(), normalized, artifact.config.ised, ised.ObjectOptions{
+			Unwind:        artifact.hasOption("+unwind"),
+			ReturnAddress: artifact.config.returnAddress,
+			Random:        h.random,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	if artifact.hasOption("+regdance") {
+		if _, err := regdance.Apply(context.Background(), normalized, regdance.Options{Random: h.random}); err != nil {
+			return nil, err
+		}
+	}
+	if artifact.hasOption("+shatter") {
+		if artifact.hasOption("+unwind") {
+			return nil, errors.New("Options +shatter and +unwind are not compatible")
+		}
+		if _, err := shatter.Apply(context.Background(), normalized, shatter.Options{Random: h.random}); err != nil {
+			return nil, err
+		}
+	} else if artifact.hasOption("+blockparty") {
+		if _, err := blockparty.Apply(context.Background(), normalized, blockparty.Options{Random: h.random}); err != nil {
+			return nil, err
+		}
+	} else if artifact.needsFinalBTFRebuild() {
+		if _, err := shatter.Heal(context.Background(), normalized); err != nil {
+			return nil, err
+		}
+	}
+	var generatedUnwind *unwindgen.Result
+	if artifact.hasOption("+unwind") {
+		var snapshot hooks.Snapshot
+		if artifact.config.hooks != nil {
+			snapshot = artifact.config.hooks.Snapshot()
+		}
+		result, err := unwindgen.Apply(context.Background(), normalized, snapshot, unwindgen.Options{})
+		if err != nil {
+			return nil, err
+		}
+		generatedUnwind = &result
+	}
 	if err := h.writeDiagnostics(artifact, normalized); err != nil {
 		return nil, err
 	}
 	if err := applyPatches(normalized, artifact.config.patches); err != nil {
 		return nil, err
 	}
+	links := cloneLinks(artifact.config.links)
+	if generatedUnwind != nil {
+		for _, name := range artifact.config.linkPosts {
+			resource, err := unwindgen.BuildResource(name, *generatedUnwind)
+			if err != nil {
+				return nil, err
+			}
+			linked, err := linkedSection(resource)
+			if err != nil {
+				return nil, err
+			}
+			links = upsertLink(links, linked)
+		}
+		if artifact.kind == KindObject {
+			resource, err := unwindgen.BuildResource(".cpl_unwind", *generatedUnwind)
+			if err != nil {
+				return nil, err
+			}
+			if _, err := unwindgen.InstallResource(normalized, resource); err != nil {
+				return nil, err
+			}
+		}
+	}
 
 	switch artifact.kind {
 	case KindPIC, KindPIC64:
 		image, err := linker.EmitPIC(normalized, linker.PICOptions{
 			EntrySymbol: entrySymbol(artifact),
-			Links:       cloneLinks(artifact.config.links),
+			Links:       links,
 		})
 		if err != nil {
 			return nil, err
@@ -121,7 +218,7 @@ func (h *Handler) export(execution *spec.ExecutionContext, artifact *Artifact) (
 	case KindObject:
 		image, err := linker.EmitPICO(normalized, linker.PICOOptions{
 			EntrySymbol: entrySymbol(artifact),
-			Links:       cloneLinks(artifact.config.links),
+			Links:       links,
 			APIs:        append([]string(nil), artifact.config.apis...),
 			Exports:     append([]linker.Export(nil), artifact.config.exports...),
 		})
@@ -130,7 +227,7 @@ func (h *Handler) export(execution *spec.ExecutionContext, artifact *Artifact) (
 		}
 		return append([]byte(nil), image.Bytes...), nil
 	case KindCOFF:
-		outputObject, err := mergeCOFFLinks(normalized, artifact.config.links)
+		outputObject, err := mergeCOFFLinks(normalized, links)
 		if err != nil {
 			return nil, err
 		}
@@ -165,6 +262,14 @@ func (h *Handler) generateRulesFor(execution *spec.ExecutionContext, artifact *A
 	}
 	result, err := rulegen.Generate(context.Background(), object, execution.Metadata(), arguments, options)
 	h.appendRuleGeneration(result, err)
+	for _, warning := range result.Warnings {
+		// Upstream exposes only the final empty-rule-set warning through the
+		// specification logger. Candidate and target omissions are internal
+		// conservative-analysis diagnostics and must not change CLI streams.
+		if warning.Code == rulegen.WarningNoRules && warning.Message != "" {
+			execution.LogWarning(warning.Message)
+		}
+	}
 	return err
 }
 
@@ -179,13 +284,20 @@ func (h *Handler) applyOrderTransforms(artifact *Artifact, object *coff.Object) 
 	for _, exported := range artifact.config.exports {
 		exports = append(exports, exported.Symbol)
 	}
+	var catchHandlers []string
+	if artifact.config.hooks != nil {
+		for _, configured := range artifact.config.hooks.Snapshot().Catches {
+			catchHandlers = append(catchHandlers, configured.Handler)
+		}
+	}
 	_, err := btf.ApplyOrderPasses(object, btf.OrderOptions{
 		Entry:         entrySymbol(artifact),
 		Exports:       exports,
+		CatchHandlers: catchHandlers,
 		GoFirst:       goFirst,
 		Optimize:      optimize,
 		Disco:         disco,
-		PreserveFirst: goFirst,
+		PreserveFirst: artifact.kind == KindPIC || artifact.kind == KindPIC64,
 		Random:        h.random,
 	})
 	return err
@@ -194,6 +306,17 @@ func (h *Handler) applyOrderTransforms(artifact *Artifact, object *coff.Object) 
 func (a *Artifact) hasOption(option string) bool {
 	_, ok := a.config.options[option]
 	return ok
+}
+
+// needsFinalBTFRebuild mirrors Modify.ShatterPass.check in Crystal Palace.
+// The no-filter pass heals synthetic ISED EB 00 split markers and normalizes
+// local branches after earlier transforms. A lone +relax is the upstream
+// exception because it is applied outside the BTF pipeline.
+func (a *Artifact) needsFinalBTFRebuild() bool {
+	if !a.config.ised.IsEmpty() {
+		return true
+	}
+	return len(a.config.options) != 0 && !(len(a.config.options) == 1 && a.hasOption("+relax"))
 }
 
 func entrySymbol(artifact *Artifact) string {
@@ -254,6 +377,38 @@ func mergeCOFFLinks(object *coff.Object, links []linker.LinkedSection) (*coff.Ob
 		objects = append(objects, additional)
 	}
 	return linker.Merge(objects...)
+}
+
+func linkedSection(section *coff.Section) (linker.LinkedSection, error) {
+	if section == nil || section.Name == "" {
+		return linker.LinkedSection{}, errors.New("engine: cannot link a nil or unnamed section")
+	}
+	linked := linker.LinkedSection{
+		Name:      section.Name,
+		Data:      append([]byte(nil), section.Data...),
+		Alignment: section.Alignment,
+	}
+	for index, relocation := range section.Relocations {
+		if relocation == nil || relocation.SymbolName == "" {
+			return linker.LinkedSection{}, fmt.Errorf("engine: linked section %q relocation %d is nil or unnamed", section.Name, index)
+		}
+		linked.Relocations = append(linked.Relocations, linker.LinkedRelocation{
+			VirtualAddress: relocation.VirtualAddress,
+			SymbolName:     relocation.SymbolName,
+			Type:           relocation.Type,
+		})
+	}
+	return linked, nil
+}
+
+func upsertLink(links []linker.LinkedSection, replacement linker.LinkedSection) []linker.LinkedSection {
+	for index := range links {
+		if links[index].Name == replacement.Name {
+			links[index] = replacement
+			return links
+		}
+	}
+	return append(links, replacement)
 }
 
 func applyStrip(object *coff.Object, requested map[string]struct{}) error {
@@ -338,6 +493,9 @@ func diagnosticTitle(title string) string {
 }
 
 func (h *Handler) writeDiagnostic(output *DiagnosticOutput, content []byte) error {
+	h.diagnosticsMu.Lock()
+	defer h.diagnosticsMu.Unlock()
+
 	if output.Stdout {
 		writer := h.stdout
 		if writer == nil {
@@ -349,5 +507,25 @@ func (h *Handler) writeDiagnostic(output *DiagnosticOutput, content []byte) erro
 	if output.Path == "" {
 		return errors.New("diagnostic output path is empty")
 	}
-	return os.WriteFile(output.Path, content, 0o644)
+	if h.diagnosticFiles == nil {
+		h.diagnosticFiles = make(map[string]struct{})
+	}
+	flags := os.O_CREATE | os.O_WRONLY | os.O_TRUNC
+	if _, written := h.diagnosticFiles[output.Path]; written {
+		flags = os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	}
+	file, err := os.OpenFile(output.Path, flags, 0o644)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.Write(content)
+	closeErr := file.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	h.diagnosticFiles[output.Path] = struct{}{}
+	return nil
 }
