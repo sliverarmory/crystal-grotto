@@ -6,6 +6,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -17,7 +18,10 @@ import (
 	"github.com/sliverarmory/crystal-grotto/internal/binutil"
 	"github.com/sliverarmory/crystal-grotto/internal/coff"
 	crystalhash "github.com/sliverarmory/crystal-grotto/internal/hash"
+	hookmodel "github.com/sliverarmory/crystal-grotto/internal/hooks"
+	"github.com/sliverarmory/crystal-grotto/internal/ised"
 	"github.com/sliverarmory/crystal-grotto/internal/linker"
+	"github.com/sliverarmory/crystal-grotto/internal/resolver"
 	"github.com/sliverarmory/crystal-grotto/internal/rulegen"
 	"github.com/sliverarmory/crystal-grotto/internal/spec"
 )
@@ -187,7 +191,13 @@ func (h *Handler) Handle(context *spec.ExecutionContext, command *spec.Command, 
 		return true, h.handleFixPointers(context, command, arguments)
 	case "fixbss":
 		return true, h.handleFixBSS(context, command, arguments)
-	case "dfr", "attach", "redirect", "addhook", "filterhooks", "preserve", "protect", "optout", "intrinsic", "catch", "ised", "linkpost":
+	case "attach", "redirect", "addhook", "filterhooks", "preserve", "protect", "optout", "intrinsic", "catch":
+		return true, h.handleHookDirective(context, command, arguments)
+	case "dfr":
+		return true, h.handleResolver(context, command, arguments)
+	case "ised":
+		return true, h.handleISED(context, command, arguments)
+	case "linkpost":
 		if err := h.validateDeferred(context, command, arguments); err != nil {
 			return true, err
 		}
@@ -197,6 +207,70 @@ func (h *Handler) Handle(context *spec.ExecutionContext, command *spec.Command, 
 	default:
 		return false, nil
 	}
+}
+
+func (h *Handler) handleISED(execution *spec.ExecutionContext, command *spec.Command, arguments []string) error {
+	if len(arguments) == 0 {
+		return errors.New("ised expects a verb, pattern, and byte variable")
+	}
+	content, err := execution.Environment().Bytes(arguments[len(arguments)-1])
+	if err != nil {
+		return err
+	}
+	directive := ised.Directive{
+		Arguments: append([]string(nil), arguments...),
+		Options:   command.Options(),
+		Content:   content,
+	}
+	return mutateArtifact(execution, func(artifact *Artifact) error {
+		updated, err := ised.Replay(artifact.config.ised, []ised.Directive{directive})
+		if err != nil {
+			return err
+		}
+		artifact.config.ised = updated
+		return nil
+	})
+}
+
+func (h *Handler) handleResolver(execution *spec.ExecutionContext, command *spec.Command, arguments []string) error {
+	directive, err := resolver.ParseDirective(arguments, command.HasOption("+clear"))
+	if err != nil {
+		return err
+	}
+	return mutateArtifact(execution, func(artifact *Artifact) error {
+		updated, err := resolver.Replay(artifact.object, artifact.config.resolvers, []resolver.Directive{directive})
+		if err != nil {
+			return err
+		}
+		artifact.config.resolvers = updated
+		return nil
+	})
+}
+
+func (h *Handler) handleHookDirective(execution *spec.ExecutionContext, command *spec.Command, arguments []string) error {
+	directive, err := hookmodel.Parse(command.Name(), arguments)
+	if err != nil {
+		return err
+	}
+	return mutateArtifact(execution, func(artifact *Artifact) error {
+		if artifact.config.hooks == nil {
+			model, err := hookmodel.New(artifact.object)
+			if err != nil {
+				return err
+			}
+			artifact.config.hooks = model
+		}
+		updated, err := artifact.config.hooks.Apply(context.Background(), artifact.object, directive,
+			hookmodel.ByteResolver(func(reference string) ([]byte, error) {
+				return execution.Environment().Bytes(reference)
+			}),
+		)
+		if err != nil {
+			return err
+		}
+		artifact.config.hooks = updated
+		return nil
+	})
 }
 
 func (h *Handler) handleMake(context *spec.ExecutionContext, command *spec.Command, arguments []string) error {
@@ -358,12 +432,9 @@ func (h *Handler) handleImport(context *spec.ExecutionContext, command *spec.Com
 		if artifact.kind != KindObject {
 			return errors.New("Argument is not a PICO (COFF) - can't import functions to it")
 		}
-		apis := binutil.SplitList(arguments[0])
-		if len(apis) < 1 || apis[0] != "LoadLibraryA" {
-			return errors.New("LoadLibraryA is required as the first API entry.")
-		}
-		if len(apis) < 2 || apis[1] != "GetProcAddress" {
-			return errors.New("GetProcAddress is required as the second API entry.")
+		apis, err := resolver.ParseAPITable(arguments[0])
+		if err != nil {
+			return err
 		}
 		artifact.config.apis = append([]string(nil), apis...)
 		return nil

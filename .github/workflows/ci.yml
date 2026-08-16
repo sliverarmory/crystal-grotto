@@ -53,7 +53,19 @@ jobs:
         run: go vet ./...
 
       - name: Run unit and deterministic E2E tests
-        run: go test -race -count=1 ./...
+        run: go test -count=1 ./...
+
+      - name: Run race tests
+        shell: bash
+        run: |
+          mapfile -t packages < <(go list ./... | grep -Ev '/internal/(btf|mutate)$')
+          go test -race -p=2 -count=1 "${packages[@]}"
+
+      - name: Race-test mutation on independent objects
+        run: go test -race -count=1 -run '^TestApplyConcurrentIndependentObjects$' ./internal/mutate
+
+      - name: Race-test easy-PIC shared-object mutation
+        run: go test -race -count=1 -run '^TestFixConcurrentCallsOnOneObject$' ./internal/btf
 
       - name: Build command
         run: go build -trimpath -o "${RUNNER_TEMP}/crystal-grotto" ./cmd/crystal-grotto

@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -137,6 +139,219 @@ func TestMinGWCOFFCompatibility(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestYARAGenerationCompatibility(t *testing.T) {
+	palaceJAR := requireArtifact(t, palaceJAREnv, false)
+	grottoBin := requireArtifact(t, grottoBinEnv, true)
+	java, err := exec.LookPath("java")
+	if err != nil {
+		t.Fatalf("compat build tag requires java in PATH: %v", err)
+	}
+	compiler, err := exec.LookPath("x86_64-w64-mingw32-gcc")
+	if err != nil {
+		t.Fatalf("compat build tag requires x86_64-w64-mingw32-gcc in PATH: %v", err)
+	}
+	root := repositoryRoot(t)
+	fixtures := filepath.Join(root, "testdata", "modules", "coff")
+	workDir := t.TempDir()
+	objectPath := filepath.Join(workDir, "rulegen.x64.o")
+	compile := exec.Command(compiler, "-c", "-o", objectPath, filepath.Join(fixtures, "rulegen.x64.S"))
+	compile.Dir = workDir
+	if output, err := compile.CombinedOutput(); err != nil {
+		t.Fatalf("compile YARA COFF fixture: %v\n%s", err, output)
+	}
+
+	specPath := filepath.Join(fixtures, "rulegen.spec")
+	grottoOutput, palaceOutput := filepath.Join(workDir, "grotto.pic"), filepath.Join(workDir, "palace.pic")
+	grottoRules, palaceRules := filepath.Join(workDir, "grotto.yar"), filepath.Join(workDir, "palace.yar")
+	grottoStdout, grottoStderr, err := run(grottoBin, workDir, "link", specPath, objectPath, grottoOutput, "-g", grottoRules)
+	if err != nil {
+		t.Fatalf("Crystal Grotto YARA generation failed: %v\nstdout:\n%s\nstderr:\n%s", err, grottoStdout, grottoStderr)
+	}
+	palaceStdout, palaceStderr, err := run(java, workDir, "-jar", palaceJAR, "link", specPath, objectPath, palaceOutput, "-g", palaceRules)
+	if err != nil {
+		t.Fatalf("Crystal Palace YARA generation failed: %v\nstdout:\n%s\nstderr:\n%s", err, palaceStdout, palaceStderr)
+	}
+	if !bytes.Equal(grottoStdout, palaceStdout) || !bytes.Equal(grottoStderr, palaceStderr) {
+		t.Fatalf("YARA process output differs\nGrotto stdout: %q\nPalace stdout: %q\nGrotto stderr: %q\nPalace stderr: %q",
+			grottoStdout, palaceStdout, grottoStderr, palaceStderr)
+	}
+	if got, want := readOutput(t, grottoOutput), readOutput(t, palaceOutput); !bytes.Equal(got, want) {
+		t.Fatalf("YARA fixture program differs\nGrotto: %x\nPalace: %x", got, want)
+	}
+	grottoSemantic := parseYARASemantics(t, readOutput(t, grottoRules))
+	palaceSemantic := parseYARASemantics(t, readOutput(t, palaceRules))
+	if !reflect.DeepEqual(grottoSemantic, palaceSemantic) {
+		t.Fatalf("YARA semantics differ\nGrotto: %#v\nPalace: %#v\n\nGrotto YARA:\n%s\nPalace YARA:\n%s",
+			grottoSemantic, palaceSemantic, readOutput(t, grottoRules), readOutput(t, palaceRules))
+	}
+}
+
+func TestDFRSemanticCompatibility(t *testing.T) {
+	palaceJAR := requireArtifact(t, palaceJAREnv, false)
+	grottoBin := requireArtifact(t, grottoBinEnv, true)
+	java, err := exec.LookPath("java")
+	if err != nil {
+		t.Fatalf("compat build tag requires java in PATH: %v", err)
+	}
+	compiler, err := exec.LookPath("x86_64-w64-mingw32-gcc")
+	if err != nil {
+		t.Fatalf("compat build tag requires x86_64-w64-mingw32-gcc in PATH: %v", err)
+	}
+	root := repositoryRoot(t)
+	fixtures := filepath.Join(root, "testdata", "modules", "coff")
+	workDir := t.TempDir()
+	objectPath := filepath.Join(workDir, "dfr.x64.o")
+	compile := exec.Command(compiler, "-c", "-o", objectPath, filepath.Join(fixtures, "dfr.x64.S"))
+	compile.Dir = workDir
+	if output, err := compile.CombinedOutput(); err != nil {
+		t.Fatalf("compile DFR COFF fixture: %v\n%s", err, output)
+	}
+
+	specPath := filepath.Join(fixtures, "dfr.spec")
+	grottoOutput, palaceOutput := filepath.Join(workDir, "grotto.pic"), filepath.Join(workDir, "palace.pic")
+	grottoStdout, grottoStderr, err := run(grottoBin, workDir, "link", specPath, objectPath, grottoOutput)
+	if err != nil {
+		t.Fatalf("Crystal Grotto DFR failed: %v\nstdout:\n%s\nstderr:\n%s", err, grottoStdout, grottoStderr)
+	}
+	palaceStdout, palaceStderr, err := run(java, workDir, "-jar", palaceJAR, "link", specPath, objectPath, palaceOutput)
+	if err != nil {
+		t.Fatalf("Crystal Palace DFR failed: %v\nstdout:\n%s\nstderr:\n%s", err, palaceStdout, palaceStderr)
+	}
+	if !bytes.Equal(grottoStdout, palaceStdout) || !bytes.Equal(grottoStderr, palaceStderr) {
+		t.Fatalf("DFR process output differs\nGrotto stdout: %q\nPalace stdout: %q\nGrotto stderr: %q\nPalace stderr: %q",
+			grottoStdout, palaceStdout, grottoStderr, palaceStderr)
+	}
+	if runtime.GOARCH != "amd64" {
+		t.Logf("generated both DFR programs; execution check requires an amd64 host (running %s)", runtime.GOARCH)
+		return
+	}
+	hostCompiler, err := exec.LookPath("cc")
+	if err != nil {
+		t.Fatalf("compat build tag requires a host C compiler in PATH: %v", err)
+	}
+
+	runnerSource := filepath.Join(workDir, "runpic.c")
+	if err := os.WriteFile(runnerSource, []byte(picRunnerSource), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := filepath.Join(workDir, "runpic")
+	hostArgs := []string{"-O2", "-Wall", "-Wextra", "-Werror"}
+	if runtime.GOOS == "darwin" {
+		hostArgs = append(hostArgs, "-arch", "x86_64")
+	}
+	hostArgs = append(hostArgs, "-o", runner, runnerSource)
+	hostBuild := exec.Command(hostCompiler, hostArgs...)
+	if output, err := hostBuild.CombinedOutput(); err != nil {
+		t.Fatalf("compile PIC runner: %v\n%s", err, output)
+	}
+	for _, generated := range []struct {
+		name string
+		path string
+	}{
+		{name: "Crystal Grotto", path: grottoOutput},
+		{name: "Crystal Palace", path: palaceOutput},
+	} {
+		stdout, stderr, err := run(runner, workDir, generated.path)
+		if err != nil {
+			t.Fatalf("execute %s DFR PIC: %v\nstdout:\n%s\nstderr:\n%s", generated.name, err, stdout, stderr)
+		}
+		if string(stdout) != "42\n" || len(stderr) != 0 {
+			t.Fatalf("%s DFR PIC result: stdout=%q stderr=%q", generated.name, stdout, stderr)
+		}
+	}
+}
+
+const picRunnerSource = `#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
+#define MAP_ANONYMOUS MAP_ANON
+#endif
+
+int main(int argc, char **argv) {
+	if (argc != 2) return 64;
+	int fd = open(argv[1], O_RDONLY);
+	if (fd < 0) return 65;
+	struct stat info;
+	if (fstat(fd, &info) != 0 || info.st_size <= 0) return 66;
+	size_t size = (size_t)info.st_size;
+	void *code = mmap(NULL, size, PROT_READ | PROT_WRITE,
+	                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (code == MAP_FAILED) return 67;
+	size_t offset = 0;
+	while (offset < size) {
+		ssize_t count = read(fd, (unsigned char *)code + offset, size - offset);
+		if (count <= 0) return 68;
+		offset += (size_t)count;
+	}
+	close(fd);
+	if (mprotect(code, size, PROT_READ | PROT_EXEC) != 0) return 69;
+	__builtin___clear_cache((char *)code, (char *)code + size);
+	int (*entry)(void) = (int (*)(void))code;
+	int result = entry();
+	printf("%d\n", result);
+	return 0;
+}
+`
+
+type yaraSemantics struct {
+	Metadata   []string
+	Signatures []string
+	Condition  []string
+}
+
+func parseYARASemantics(t *testing.T, content []byte) yaraSemantics {
+	t.Helper()
+	result := yaraSemantics{}
+	section := ""
+	for _, raw := range strings.Split(string(content), "\n") {
+		line := strings.TrimSpace(raw)
+		switch line {
+		case "meta:":
+			section = "meta"
+			continue
+		case "strings:":
+			section = "strings"
+			continue
+		case "condition:":
+			section = "condition"
+			continue
+		}
+		if line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*") ||
+			strings.HasPrefix(line, "*") || line == "}" || strings.HasPrefix(line, "rule ") {
+			continue
+		}
+		switch section {
+		case "meta":
+			if strings.HasPrefix(line, "date = ") {
+				continue
+			}
+			result.Metadata = append(result.Metadata, line)
+		case "strings":
+			separator := strings.Index(line, "=")
+			if !strings.HasPrefix(line, "$") || separator < 0 {
+				t.Fatalf("cannot parse YARA signature line %q", line)
+			}
+			result.Signatures = append(result.Signatures, strings.TrimSpace(line[separator+1:]))
+		case "condition":
+			result.Condition = append(result.Condition, line)
+		}
+	}
+	sort.Strings(result.Metadata)
+	sort.Strings(result.Signatures)
+	if len(result.Signatures) == 0 || len(result.Condition) == 0 {
+		t.Fatalf("YARA output has no signatures or condition:\n%s", content)
+	}
+	return result
 }
 
 type compatibilityCase struct {

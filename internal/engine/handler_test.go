@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"os"
 	"path/filepath"
@@ -298,17 +299,17 @@ func TestHandlerOrderOptionsAndUnsupportedConfiguration(t *testing.T) {
 		}
 	})
 
-	t.Run("deferred command", func(t *testing.T) {
+	t.Run("configuration-only hook directive", func(t *testing.T) {
 		t.Parallel()
 		object := textObject(t, coff.MachineAMD64, []byte{0xc3}, function("go", 0))
-		err := runEngineSpecError(t, "x64", `x64:
+		output := runEngineSpec(t, "x64", `x64:
   push $INPUT
   make pic
   protect "go"
   export
 `, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
-		if !strings.Contains(err.Error(), "unsupported configured feature(s): protect") {
-			t.Fatalf("error = %v", err)
+		if !bytes.Equal(output, []byte{0xc3}) {
+			t.Fatalf("protect-only output = %x", output)
 		}
 	})
 }
@@ -362,6 +363,227 @@ func TestHandlerEasyPICFixes(t *testing.T) {
 		err = runEngineSpecError(t, "x86", "x86:\n  push $INPUT\n  make coff\n  fixptrs \"_go\"\n", spec.Environment{"$INPUT": marshalTestObject(t, x86)}, New())
 		if !strings.Contains(err.Error(), "fixptrs [_symbol] is x86 PIC-only") {
 			t.Fatalf("fixptrs error = %v", err)
+		}
+	})
+}
+
+func TestHandlerDynamicFunctionResolvers(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		arch           string
+		machine        coff.Machine
+		entry          string
+		resolver       string
+		importName     string
+		relocationType uint16
+		method         string
+	}{
+		{
+			name: "x64 ror13", arch: "x64", machine: coff.MachineAMD64,
+			entry: "go", resolver: "resolve", importName: "__imp_KERNEL32$Sleep",
+			relocationType: coff.RelAMD64Rel32, method: "ror13",
+		},
+		{
+			name: "x86 strings", arch: "x86", machine: coff.MachineI386,
+			entry: "_go", resolver: "_resolve", importName: "__imp__KERNEL32$Sleep@4",
+			relocationType: coff.RelI386Dir32, method: "strings",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			object := textObject(t, test.machine,
+				[]byte{0xff, 0x15, 0, 0, 0, 0, 0xc3, 0xc3},
+				function(test.entry, 0), function(test.resolver, 7),
+			)
+			imported := &coff.Symbol{Name: test.importName, Type: coff.SymbolTypeFunction, StorageClass: coff.SymbolClassExternal}
+			if err := object.AddSymbol(imported); err != nil {
+				t.Fatal(err)
+			}
+			text := object.GetSection(".text")
+			text.Relocations = []*coff.Relocation{{
+				Section: text, VirtualAddress: 2, SymbolName: imported.Name,
+				Symbol: imported, Type: test.relocationType,
+			}}
+
+			program := test.arch + ":\n  push $INPUT\n  make pic\n  dfr \"" + test.resolver + "\" \"" + test.method + "\"\n  export\n"
+			output := runEngineSpec(t, test.arch, program, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+			if len(output) <= len(text.Data) || output[0] != 0x90 || output[1] != 0xe8 {
+				t.Fatalf("resolver PIC prefix/length = %x (%d bytes)", output, len(output))
+			}
+			stub := int64(6) + int64(int32(binary.LittleEndian.Uint32(output[2:6])))
+			if stub < int64(len(text.Data)) || stub+5 > int64(len(output)) || output[stub] != 0x9c {
+				t.Fatalf("resolver stub target = %#x in %d-byte PIC (%x)", stub, len(output), output)
+			}
+		})
+	}
+
+	t.Run("clear replaces earlier default", func(t *testing.T) {
+		t.Parallel()
+		object := textObject(t, coff.MachineAMD64,
+			[]byte{0xff, 0x15, 0, 0, 0, 0, 0xc3, 0xc3, 0xc3},
+			function("go", 0), function("first", 7), function("second", 8),
+		)
+		imported := &coff.Symbol{Name: "__imp_KERNEL32$Sleep", Type: coff.SymbolTypeFunction, StorageClass: coff.SymbolClassExternal}
+		if err := object.AddSymbol(imported); err != nil {
+			t.Fatal(err)
+		}
+		text := object.GetSection(".text")
+		text.Relocations = []*coff.Relocation{{
+			Section: text, VirtualAddress: 2, SymbolName: imported.Name,
+			Symbol: imported, Type: coff.RelAMD64Rel32,
+		}}
+		output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic
+  dfr "first" "ror13"
+  dfr "second" "djb2" +clear
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+		if len(output) <= len(text.Data) {
+			t.Fatalf("resolver output = %x", output)
+		}
+	})
+}
+
+func TestHandlerMutateOptionUsesConfiguredMagic(t *testing.T) {
+	t.Parallel()
+	object := textObject(t, coff.MachineAMD64,
+		[]byte{0xb8, 0x44, 0x33, 0x22, 0x11, 0xc3},
+		function("go", 0),
+	)
+	handler := New()
+	handler.random = bytes.NewReader([]byte{0, 0, 0, 0})
+	output := runEngineSpec(t, "x64", `x64:
+  push $INPUT
+  make pic +mutate
+  magic "0x20"
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, handler)
+	want := []byte{0xb8, 0x24, 0x33, 0x22, 0x11, 0x05, 0x20, 0, 0, 0, 0xc3}
+	if !bytes.Equal(output, want) {
+		t.Fatalf("mutated PIC = %x, want %x", output, want)
+	}
+}
+
+func TestHandlerRejectsDprintfReachableFromResolver(t *testing.T) {
+	t.Parallel()
+	object := textObject(t, coff.MachineAMD64,
+		[]byte{0xc3, 0xe8, 0, 0, 0, 0, 0xc3, 0xc3},
+		function("go", 0), function("resolve", 1), function("dprintf", 7),
+	)
+	text := object.GetSection(".text")
+	dprintf := object.GetSymbol("dprintf")
+	text.Relocations = []*coff.Relocation{{
+		Section: text, VirtualAddress: 2, SymbolName: dprintf.Name,
+		Symbol: dprintf, Type: coff.RelAMD64Rel32,
+	}}
+	err := runEngineSpecError(t, "x64", `x64:
+  push $INPUT
+  make pic
+  dfr "resolve" "ror13"
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+	if !strings.Contains(err.Error(), "Don't call dprintf from dfr/fixptrs/fixbss") ||
+		!strings.Contains(err.Error(), "resolve") {
+		t.Fatalf("DangerWalk error = %v", err)
+	}
+}
+
+func TestHandlerISEDValidatesAndRetainsResolvedBytes(t *testing.T) {
+	t.Parallel()
+	object := textObject(t, coff.MachineAMD64, []byte{0x53, 0x5b, 0xc3}, function("go", 0))
+	err := runEngineSpecError(t, "x64", `x64:
+  push $INPUT
+  make pic
+  ised replace "PUSH r64" $CODE +first
+  export
+`, spec.Environment{
+		"$INPUT": marshalTestObject(t, object),
+		"$CODE":  []byte{0x90},
+	}, New())
+	if !strings.Contains(err.Error(), "unsupported configured feature(s): ised") {
+		t.Fatalf("ised export error = %v", err)
+	}
+
+	err = runEngineSpecError(t, "x64", `x64:
+  push $INPUT
+  make pic
+  ised replace "PUSH r64" $MISSING
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+	if !strings.Contains(err.Error(), "$MISSING") {
+		t.Fatalf("ised missing byte variable error = %v", err)
+	}
+}
+
+func TestHandlerHookConfigurationAndEncoderBoundaries(t *testing.T) {
+	t.Parallel()
+
+	t.Run("attach import is explicit", func(t *testing.T) {
+		t.Parallel()
+		object := textObject(t, coff.MachineAMD64,
+			[]byte{0xff, 0x15, 0, 0, 0, 0, 0xc3, 0xc3},
+			function("go", 0), function("wrapper", 7),
+		)
+		imported := &coff.Symbol{Name: "__imp_KERNEL32$Sleep", Type: coff.SymbolTypeFunction, StorageClass: coff.SymbolClassExternal}
+		if err := object.AddSymbol(imported); err != nil {
+			t.Fatal(err)
+		}
+		text := object.GetSection(".text")
+		text.Relocations = []*coff.Relocation{{
+			Section: text, VirtualAddress: 2, SymbolName: imported.Name,
+			Symbol: imported, Type: coff.RelAMD64Rel32,
+		}}
+		err := runEngineSpecError(t, "x64", `x64:
+  push $INPUT
+  make pic
+  attach "KERNEL32$Sleep" "wrapper"
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+		if !strings.Contains(err.Error(), "unsupported configured feature(s): attach") {
+			t.Fatalf("attach error = %v", err)
+		}
+	})
+
+	t.Run("redirect is explicit", func(t *testing.T) {
+		t.Parallel()
+		object := textObject(t, coff.MachineAMD64, []byte{0xc3, 0xc3, 0xc3},
+			function("go", 0), function("target", 1), function("wrapper", 2),
+		)
+		err := runEngineSpecError(t, "x64", `x64:
+  push $INPUT
+  make pic
+  redirect "target" "wrapper"
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object)}, New())
+		if !strings.Contains(err.Error(), "unsupported configured feature(s): redirect") {
+			t.Fatalf("redirect error = %v", err)
+		}
+	})
+
+	t.Run("intrinsic bytes are resolved and retained", func(t *testing.T) {
+		t.Parallel()
+		object := textObject(t, coff.MachineAMD64, []byte{0xe8, 0, 0, 0, 0, 0xc3}, function("go", 0))
+		intrinsic := &coff.Symbol{Name: "__custom", Type: coff.SymbolTypeFunction, StorageClass: coff.SymbolClassExternal}
+		if err := object.AddSymbol(intrinsic); err != nil {
+			t.Fatal(err)
+		}
+		text := object.GetSection(".text")
+		text.Relocations = []*coff.Relocation{{
+			Section: text, VirtualAddress: 1, SymbolName: intrinsic.Name,
+			Symbol: intrinsic, Type: coff.RelAMD64Rel32,
+		}}
+		err := runEngineSpecError(t, "x64", `x64:
+  push $INPUT
+  make pic
+  intrinsic "__custom" $CODE
+  export
+`, spec.Environment{"$INPUT": marshalTestObject(t, object), "$CODE": []byte{0x31, 0xc0, 0xc3}}, New())
+		if !strings.Contains(err.Error(), "unsupported configured feature(s): intrinsic") {
+			t.Fatalf("intrinsic error = %v", err)
 		}
 	})
 }

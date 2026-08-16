@@ -14,7 +14,10 @@ import (
 	"strings"
 
 	"github.com/sliverarmory/crystal-grotto/internal/coff"
+	hookmodel "github.com/sliverarmory/crystal-grotto/internal/hooks"
+	"github.com/sliverarmory/crystal-grotto/internal/ised"
 	"github.com/sliverarmory/crystal-grotto/internal/linker"
+	"github.com/sliverarmory/crystal-grotto/internal/resolver"
 )
 
 // Kind is the value exposed to Crystal Palace hooks through StackValue.Type.
@@ -66,6 +69,9 @@ type Configuration struct {
 	RuleArguments []string
 	GetBSS        string
 	ReturnAddress string
+	Hooks         hookmodel.Snapshot
+	ISED          ised.Configuration
+	Resolvers     resolver.Configuration
 	COFFParse     *DiagnosticOutput
 	Disassemble   *DiagnosticOutput
 	Deferred      []DeferredCommand
@@ -98,6 +104,9 @@ type artifactConfig struct {
 	ruleArguments []string
 	getBSS        string
 	returnAddress string
+	hooks         *hookmodel.Model
+	ised          ised.Configuration
+	resolvers     resolver.Configuration
 
 	coffParse   *DiagnosticOutput
 	disassemble *DiagnosticOutput
@@ -109,6 +118,7 @@ func newArtifact(kind Kind, object *coff.Object) *Artifact {
 	if object != nil && object.Machine == coff.MachineI386 {
 		entry = "_go"
 	}
+	hooks, _ := hookmodel.New(object)
 	return &Artifact{
 		kind:   kind,
 		object: object,
@@ -120,6 +130,9 @@ func newArtifact(kind Kind, object *coff.Object) *Artifact {
 			linkIndex:   make(map[string]int),
 			exportIndex: make(map[string]int),
 			apis:        []string{"LoadLibraryA", "GetProcAddress"},
+			hooks:       hooks,
+			ised:        ised.EmptyConfiguration(),
+			resolvers:   resolver.EmptyConfiguration(),
 		},
 	}
 }
@@ -167,9 +180,14 @@ func (a *Artifact) Configuration() Configuration {
 		RuleArguments: append([]string(nil), a.config.ruleArguments...),
 		GetBSS:        a.config.getBSS,
 		ReturnAddress: a.config.returnAddress,
+		ISED:          a.config.ised,
+		Resolvers:     a.config.resolvers,
 		COFFParse:     cloneDiagnostic(a.config.coffParse),
 		Disassemble:   cloneDiagnostic(a.config.disassemble),
 		Deferred:      cloneDeferred(a.config.deferred),
+	}
+	if a.config.hooks != nil {
+		configuration.Hooks = a.config.hooks.Snapshot()
 	}
 	return configuration
 }
@@ -261,6 +279,9 @@ func (a *Artifact) unsupportedError() error {
 			features[command.Name] = struct{}{}
 		}
 	}
+	if !a.config.ised.IsEmpty() {
+		features["ised"] = struct{}{}
+	}
 	if len(features) == 0 {
 		return nil
 	}
@@ -270,6 +291,7 @@ func (a *Artifact) unsupportedError() error {
 var supportedTransformOptions = map[string]struct{}{
 	"+disco":    {},
 	"+gofirst":  {},
+	"+mutate":   {},
 	"+optimize": {},
 	"+relax":    {},
 }

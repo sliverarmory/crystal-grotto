@@ -16,7 +16,10 @@ import (
 	"github.com/sliverarmory/crystal-grotto/internal/coff"
 	"github.com/sliverarmory/crystal-grotto/internal/coffwrite"
 	"github.com/sliverarmory/crystal-grotto/internal/linker"
+	"github.com/sliverarmory/crystal-grotto/internal/mutate"
+	"github.com/sliverarmory/crystal-grotto/internal/resolver"
 	"github.com/sliverarmory/crystal-grotto/internal/rulegen"
+	"github.com/sliverarmory/crystal-grotto/internal/safety"
 	"github.com/sliverarmory/crystal-grotto/internal/spec"
 	"github.com/sliverarmory/crystal-grotto/internal/x86"
 )
@@ -49,6 +52,35 @@ func (h *Handler) export(execution *spec.ExecutionContext, artifact *Artifact) (
 	if err != nil {
 		return nil, err
 	}
+	if features := artifact.hookEncodingFeatures(normalized); len(features) != 0 {
+		return nil, &UnsupportedError{Features: features}
+	}
+	roots := artifact.config.resolvers.ResolverFunctions()
+	if artifact.config.getBSS != "" {
+		roots = append(roots, artifact.config.getBSS)
+	}
+	if artifact.config.returnAddress != "" {
+		roots = append(roots, artifact.config.returnAddress)
+	}
+	if len(roots) != 0 {
+		if _, err := safety.Check(context.Background(), normalized, roots, safety.Options{}); err != nil {
+			return nil, err
+		}
+	}
+	if artifact.config.resolvers.HasResolvers() {
+		normalized, _, err = resolver.ApplyBuiltin(normalized, artifact.config.resolvers)
+		if err != nil {
+			return nil, err
+		}
+		// The built-in resolver keeps generated stubs in a guarded .text
+		// subsection so source offsets never move. Fold that subsection into the
+		// final text layout and resolve its local REL32 relocations before later
+		// program passes and output generation.
+		normalized, err = linker.Merge(normalized)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if _, err := btf.ApplyEasyPICFixes(context.Background(), normalized, btf.EasyPICOptions{
 		GetBSS:        artifact.config.getBSS,
 		ReturnAddress: artifact.config.returnAddress,
@@ -58,13 +90,21 @@ func (h *Handler) export(execution *spec.ExecutionContext, artifact *Artifact) (
 	if err := h.applyOrderTransforms(artifact, normalized); err != nil {
 		return nil, err
 	}
+	if err := h.generateRulesFor(execution, artifact, normalized); err != nil {
+		return nil, err
+	}
+	if artifact.hasOption("+mutate") {
+		if _, err := mutate.Apply(context.Background(), normalized, mutate.Options{
+			Magic:  append([]uint32(nil), artifact.config.magic...),
+			Random: h.random,
+		}); err != nil {
+			return nil, err
+		}
+	}
 	if err := h.writeDiagnostics(artifact, normalized); err != nil {
 		return nil, err
 	}
 	if err := applyPatches(normalized, artifact.config.patches); err != nil {
-		return nil, err
-	}
-	if err := h.generateRulesFor(execution, artifact, normalized); err != nil {
 		return nil, err
 	}
 

@@ -16,6 +16,14 @@ The archive date and upstream runtime version string intentionally identify the 
 
 The upstream Java source is not committed to this repository. The local `cpsrc/` path is ignored, and CI downloads the pinned archive into temporary runner storage only after verifying its checksum.
 
+## Compatibility status
+
+The supported command, object-format, transformation, and sidecar surface—and
+the remaining porting work—is tracked in
+[docs/compatibility.md](docs/compatibility.md). Program-affecting features that
+are not yet implemented return explicit errors instead of silently producing
+incomplete output.
+
 ## Command-line interface
 
 The `crystal-grotto` executable uses [Cobra](https://github.com/spf13/cobra) for its command tree and help interface. Its primary subcommands follow Crystal Palace:
@@ -73,13 +81,19 @@ Run all unit tests and deterministic Go end-to-end tests with:
 go test -count=1 ./...
 ```
 
-Before submitting a change, run the same core checks used by CI:
+Before submitting a change, run the core checks locally:
 
 ```console
 go test -race -count=1 ./...
 go vet ./...
-go build ./cmd/crystal-grotto
+go build -trimpath -o crystal-grotto ./cmd/crystal-grotto
 ```
+
+The full BTF race suite is deliberately exhaustive and can take several
+minutes under instrumentation; the full mutation suite has similar decoder
+startup costs. CI runs every ordinary test, race-tests the remaining packages
+with bounded package parallelism, and runs the dedicated mutation and
+shared-object easy-PIC concurrency tests under the race detector.
 
 The normal suite is hermetic: it does not download, compile, or execute Crystal Palace. Test modules maintained in this repository are original Crystal Grotto fixtures; upstream Java and demo source remain outside the repository.
 
@@ -105,7 +119,7 @@ The helper refuses to overwrite an existing `cpsrc/` directory. Use a new tempor
 
 GitHub Actions runs on every pull request targeting `main` and every push to `main` (including merges). The workflow has two layers:
 
-1. formatting, module verification, `go vet`, race-enabled unit/end-to-end tests, and a CLI build; and
+1. formatting, module verification, `go vet`, the complete unit/end-to-end suite, broad race coverage plus focused mutation/easy-PIC concurrency races, and a CLI build; and
 2. a Linux compatibility job with Java, Ant, and MinGW-w64 that builds the checksum-pinned Crystal Palace reference in runner-temporary storage and runs the `compat` test suite.
 
 No upstream source or generated JAR is uploaded or committed by the workflow.
