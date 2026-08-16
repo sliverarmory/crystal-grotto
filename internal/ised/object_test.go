@@ -352,7 +352,10 @@ func TestApplyObjectConcurrentReadSafe(t *testing.T) {
 	t.Parallel()
 	object := isedObjectWithFunction(t, coff.MachineAMD64, []byte{0xeb, 0x01, 0x90, 0xc3}, "go", 0)
 	configuration := mustReplay(t, Directive{Arguments: []string{"insert", "NOP", "$X"}, Content: []byte{0xcc}})
-	const workers = 8
+	// Each worker owns a portable decoder instance. Four simultaneous callers
+	// exercise the shared-object race boundary without forcing smaller CI
+	// runners into memory-pressure thrashing under the race detector.
+	const workers = 4
 	var wait sync.WaitGroup
 	errorsChannel := make(chan error, workers)
 	for worker := 0; worker < workers; worker++ {

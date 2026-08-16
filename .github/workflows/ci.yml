@@ -53,7 +53,10 @@ jobs:
         run: go vet ./...
 
       - name: Run unit and deterministic E2E tests
-        run: go test -count=1 ./...
+        # Decoder-backed packages are CPU and memory intensive. Running package
+        # tests serially avoids oversubscribing the smaller hosted runner while
+        # preserving the complete ordinary and E2E suite.
+        run: go test -v -p=1 -count=1 -timeout=10m ./...
 
       - name: Build command
         run: go build -trimpath -o "${RUNNER_TEMP}/crystal-grotto" ./cmd/crystal-grotto
@@ -87,6 +90,9 @@ jobs:
     timeout-minutes: 15
     strategy:
       fail-fast: false
+      # Provisioning every decoder-heavy race job at once has caused transient
+      # hosted-runner shutdowns. Limit the fan-out without dropping any shard.
+      max-parallel: 4
       matrix:
         include:
           - name: x86 decoder
@@ -154,7 +160,7 @@ jobs:
           cache: true
 
       - name: Run focused race test
-        run: go test -race -count=1 -run "${{ matrix.test }}" "${{ matrix.package }}"
+        run: go test -race -v -count=1 -timeout=10m -run "${{ matrix.test }}" "${{ matrix.package }}"
 
   compatibility:
     name: Crystal Palace compatibility
@@ -199,4 +205,6 @@ jobs:
         env:
           CRYSTAL_PALACE_JAR: ${{ runner.temp }}/crystal-palace/cpsrc/build/crystalpalace.jar
           CRYSTAL_GROTTO_BIN: ${{ runner.temp }}/crystal-grotto
-        run: go test -tags=compat -count=1 ./...
+        # The ordinary suite already ran in the unit job; every compat-tagged
+        # differential lives in this package.
+        run: go test -tags=compat -v -count=1 -timeout=20m ./test/compat

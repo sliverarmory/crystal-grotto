@@ -14,6 +14,8 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -31,6 +33,7 @@ const (
 	defaultWriteTimeout      = 5 * time.Minute
 	defaultIdleTimeout       = 60 * time.Second
 	defaultShutdownTimeout   = 5 * time.Second
+	upstreamDieDelay         = 200 * time.Millisecond
 )
 
 // Environment contains byte variables ($NAME) and string variables (%name).
@@ -127,18 +130,24 @@ func WithContext(stage string, err error) error {
 	return &ContextError{Context: stage, Err: err}
 }
 
-// Config controls transport-level resource limits. A zero MaxBodyBytes uses
-// DefaultMaxBodyBytes; negative limits are rejected.
+// Config controls transport-level resource limits and optional compatibility
+// behavior. A zero MaxBodyBytes uses DefaultMaxBodyBytes; negative limits are
+// rejected. EnableDie exposes Crystal Palace's unauthenticated /die endpoint.
+// It is disabled by default because a browser can trigger the endpoint with a
+// loopback GET request.
 type Config struct {
 	MaxBodyBytes int64
+	EnableDie    bool
 }
 
-// Sidecar is an immutable, concurrency-safe HTTP handler. Its Linker is
-// called concurrently and must provide its own safety for shared state.
+// Sidecar is a concurrency-safe HTTP handler. Its Linker is called
+// concurrently and must provide its own safety for shared state.
 type Sidecar struct {
 	linker       Linker
 	maxBodyBytes int64
 	mux          *http.ServeMux
+	die          chan struct{}
+	dieOnce      sync.Once
 }
 
 // New constructs a sidecar handler.
@@ -157,6 +166,9 @@ func New(linker Linker, config Config) (*Sidecar, error) {
 	sidecar := &Sidecar{linker: linker, maxBodyBytes: maxBodyBytes}
 	sidecar.mux = http.NewServeMux()
 	sidecar.mux.HandleFunc("/link", sidecar.handleLink)
+	if config.EnableDie {
+		sidecar.die = make(chan struct{})
+	}
 	return sidecar, nil
 }
 
@@ -165,6 +177,13 @@ func (s *Sidecar) Handler() http.Handler { return s }
 
 // ServeHTTP dispatches sidecar endpoints.
 func (s *Sidecar) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	// com.sun.net.httpserver matches a registered context as a literal path
+	// prefix, so upstream's "/die" also handles paths such as "/die/now" and
+	// "/die-suffix". Preserve that behavior only when explicitly enabled.
+	if s.die != nil && strings.HasPrefix(request.URL.Path, "/die") {
+		s.handleDie(writer, request)
+		return
+	}
 	s.mux.ServeHTTP(writer, request)
 }
 
@@ -209,11 +228,13 @@ func (s *Sidecar) serve(ctx context.Context, listener net.Listener) error {
 		defer close(watcherDone)
 		select {
 		case <-ctx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
-			defer cancel()
-			_ = httpServer.Shutdown(shutdownCtx)
+		case <-s.die:
 		case <-stopWatcher:
+			return
 		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), defaultShutdownTimeout)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
 	}()
 
 	err := httpServer.Serve(listener)

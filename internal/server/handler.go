@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -56,6 +57,22 @@ func (s *Sidecar) handleLink(writer http.ResponseWriter, request *http.Request) 
 	}
 
 	writeJSON(writer, http.StatusOK, s.process(request.Context(), object))
+}
+
+// handleDie preserves Crystal Palace's opt-in shutdown contract: every HTTP
+// method receives an empty 200 response, followed by server shutdown after a
+// 200ms grace period. The library never terminates its host process directly;
+// ListenAndServe returns cleanly so a standalone CLI exits naturally.
+func (s *Sidecar) handleDie(writer http.ResponseWriter, _ *http.Request) {
+	writer.WriteHeader(http.StatusOK)
+	s.dieOnce.Do(func() {
+		go func() {
+			timer := time.NewTimer(upstreamDieDelay)
+			defer timer.Stop()
+			<-timer.C
+			close(s.die)
+		}()
+	})
 }
 
 func readJSONObject(writer http.ResponseWriter, request *http.Request, limit int64) (map[string]json.RawMessage, error) {

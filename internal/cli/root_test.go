@@ -32,6 +32,18 @@ func TestRootUsesCobraCommandContract(t *testing.T) {
 	}
 }
 
+func TestServerDieEndpointRequiresExplicitFlag(t *testing.T) {
+	t.Parallel()
+	command := newServerCommand()
+	flag := command.Flags().Lookup("enable-die")
+	if flag == nil {
+		t.Fatal("server command is missing --enable-die")
+	}
+	if flag.DefValue != "false" {
+		t.Fatalf("--enable-die default = %q, want false", flag.DefValue)
+	}
+}
+
 func TestBuildEndToEnd(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()

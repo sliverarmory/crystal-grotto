@@ -264,6 +264,65 @@ func TestTransportErrorsAndLimits(t *testing.T) {
 	}
 }
 
+func TestDieEndpointIsNotExposedByDefault(t *testing.T) {
+	t.Parallel()
+	sidecar := mustSidecar(t, successfulLinker(), Config{})
+
+	for _, target := range []string{"/die", "/die/now", "/die-suffix"} {
+		response := performRequest(sidecar, http.MethodGet, target, "ignored")
+		if response.Code != http.StatusNotFound {
+			t.Errorf("GET %s status = %d, want 404", target, response.Code)
+		}
+	}
+	if sidecar.die != nil {
+		t.Fatal("default sidecar allocated a die signal")
+	}
+}
+
+func TestEnabledDieEndpointReturnsBeforeDelayedGracefulShutdown(t *testing.T) {
+	sidecar := mustSidecar(t, successfulLinker(), Config{EnableDie: true})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	listener := newBlockingListener()
+	done := make(chan error, 1)
+	go func() { done <- sidecar.serve(ctx, listener) }()
+	<-listener.accepting
+
+	started := time.Now()
+	requests := []struct {
+		method string
+		target string
+	}{
+		{method: http.MethodGet, target: "/die"},
+		{method: http.MethodPost, target: "/die/now"},
+		{method: http.MethodDelete, target: "/die-suffix"},
+	}
+	for _, request := range requests {
+		response := performRequest(sidecar, request.method, request.target, "ignored")
+		if response.Code != http.StatusOK || response.Body.Len() != 0 {
+			t.Fatalf("%s %s response = status %d body %q, want empty 200", request.method, request.target, response.Code, response.Body.String())
+		}
+	}
+
+	select {
+	case err := <-done:
+		t.Fatalf("server stopped before the upstream grace period: %v", err)
+	case <-time.After(upstreamDieDelay / 2):
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("server shutdown: %v", err)
+		}
+		if elapsed := time.Since(started); elapsed < upstreamDieDelay {
+			t.Fatalf("server stopped after %v, want at least %v", elapsed, upstreamDieDelay)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("enabled /die did not stop ListenAndServe")
+	}
+}
+
 func TestConcurrentRequestsHaveIndependentState(t *testing.T) {
 	const requestCount = 32
 	ready := make(chan struct{}, requestCount)

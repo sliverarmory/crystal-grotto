@@ -34,6 +34,7 @@ implementation and compares the result.
 | `rule` and `-g` YARA generation | Supported with conservative candidate selection | Unit, CLI integration, and structural differential tests |
 | Repeated diagnostic outputs | Supported with truncate-once/append-later canonical-file semantics | Unit and concurrency tests |
 | Loopback JSON sidecar (`link`, `build`, and legacy `piclink` actions on `/link`) | Supported | Handler, application, and concurrency tests |
+| Upstream `/die` sidecar shutdown | Supported with explicit `server --enable-die` opt-in | Default non-exposure and delayed graceful-shutdown tests |
 
 ## Deliberate limits and work in progress
 
@@ -59,9 +60,13 @@ implementation and compares the result.
   exactly; randomized transformations require structural comparison.
 - The COFF model cannot preserve upstream parser details that it does not
   expose, including raw label-symbol entries and line-number record bytes.
-- The sidecar intentionally omits upstream `/die`, which terminates the server
-  process remotely. It binds IPv4 loopback by default, limits request bodies,
-  and uses HTTP timeouts.
+- The upstream `/die` endpoint accepts an unauthenticated request using any HTTP
+  method, returns an empty HTTP 200 response, waits 200ms, and terminates the
+  server process. Crystal Grotto leaves this browser-triggerable loopback
+  shutdown surface disabled by default. `server --enable-die` opts into the
+  endpoint; the standalone command shuts down gracefully after the same delay
+  instead of calling `os.Exit` from library code. The sidecar also limits
+  request bodies and uses HTTP timeouts.
 
 ## Differential-test contract
 

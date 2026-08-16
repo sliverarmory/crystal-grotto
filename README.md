@@ -19,10 +19,9 @@ The upstream Java source is not committed to this repository. The local `cpsrc/`
 ## Compatibility status
 
 The supported command, object-format, transformation, and sidecar surface—and
-the remaining porting work—is tracked in
-[docs/compatibility.md](docs/compatibility.md). Program-affecting features that
-are not yet implemented return explicit errors instead of silently producing
-incomplete output.
+the known conservative compatibility limits—are tracked in
+[docs/compatibility.md](docs/compatibility.md). Unsupported input forms fail
+explicitly instead of silently producing incomplete output.
 
 ## Command-line interface
 
@@ -46,6 +45,10 @@ crystal-grotto coffparse module.x64.o
 ```
 
 Use `crystal-grotto help <command>` for the complete arguments and options supported by a command.
+
+The sidecar's upstream-compatible, unauthenticated `/die` shutdown endpoint is
+disabled by default. Start it with `crystal-grotto server --enable-die` only
+when a local client specifically requires that compatibility behavior.
 
 ## Requirements
 

@@ -241,12 +241,13 @@ func transformForDisassembly(ctx context.Context, data []byte, architecture stri
 
 func newServerCommand() *cobra.Command {
 	var port int
+	var enableDie bool
 	command := &cobra.Command{
 		Use:   "server",
 		Short: "Start the JSON-over-HTTP linker sidecar",
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
-			sidecar, err := server.New(application.NewService(), server.Config{})
+			sidecar, err := server.New(application.NewService(), server.Config{EnableDie: enableDie})
 			if err != nil {
 				return err
 			}
@@ -255,5 +256,6 @@ func newServerCommand() *cobra.Command {
 		},
 	}
 	command.Flags().IntVarP(&port, "port", "p", 60060, "loopback TCP port")
+	command.Flags().BoolVar(&enableDie, "enable-die", false, "enable the unauthenticated upstream-compatible /die shutdown endpoint")
 	return command
 }
